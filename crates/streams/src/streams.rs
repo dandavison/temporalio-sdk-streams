@@ -58,7 +58,7 @@ impl Streams {
                     request,
                 )?)
                 .await?;
-                WorkflowActivationCompletedResponse {}.encode_to_vec()
+                WorkflowActivationCompletedResponse::default().encode_to_vec()
             }
             "WorkflowEvicted" => {
                 self.workflow_evicted(WorkflowEvictedRequest::decode(request)?)

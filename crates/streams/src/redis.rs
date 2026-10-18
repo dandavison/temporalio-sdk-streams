@@ -509,7 +509,7 @@ fn record(
         topic,
         payload,
         finish: kind == "finish",
-        workflow_task_commit: None,
+        ..Default::default()
     }))
 }
 

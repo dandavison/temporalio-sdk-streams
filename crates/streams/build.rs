@@ -17,6 +17,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .extern_path(
                 ".temporal.api.failure",
                 "::temporalio_protos::temporal::api::failure",
+            )
+            .extern_path(
+                ".temporal.api.protocol",
+                "::temporalio_protos::temporal::api::protocol",
             );
         c
     };
