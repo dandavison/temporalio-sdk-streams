@@ -334,8 +334,8 @@ impl RedisBackend {
             .unwrap_or_default())
     }
 
-    /// Reads the last `req.last` matching records, scanning the log backwards. It fetches the whole
-    /// log in one reply, however few records it returns.
+    /// Reads the last `req.last` matching records, scanning the log backwards, and the close if the
+    /// stream is closed. It fetches the whole log in one reply, however few records it returns.
     async fn read_last(
         &self,
         conn: &mut ConnectionManager,
@@ -355,6 +355,10 @@ impl RedisBackend {
             if let Some(r) = record(keys.cursor(&entry.id), &entry.map, &req.topics)? {
                 resp.records.insert(0, r);
             }
+        }
+        let closed: Option<String> = conn.hget(&keys.meta, "closed").await.map_err(redis_error)?;
+        if closed.as_deref() == Some("1") {
+            resp.close = Some(close_from_meta(conn, keys).await?);
         }
         Ok(resp)
     }
