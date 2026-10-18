@@ -48,16 +48,17 @@ impl Runs {
     }
 }
 
-/// The close to write when the run ends, or none if its run chain continues: a completed cron run,
-/// or a failed run with a retry policy, which the server may retry. Whether a retry happens is the
-/// server's decision, so a failed run with a retry policy is never closed by the worker, even when
-/// the server does not retry it (attempts exhausted, or a non-retryable failure); its stream stays
-/// open until its retention passes.
+/// The close to write when the run ends, or none if its run chain may continue: a cron run that
+/// completes or fails, or a failed run with a retry policy, which the server may retry. Whether a
+/// retry happens is the server's decision, so a failed run with a retry policy is never closed by
+/// the worker, even when the server does not retry it (attempts exhausted, or a non-retryable
+/// failure); its stream stays open until its retention passes. The native server closes such a
+/// stream, because it knows whether the chain continues.
 pub fn close_for_ending(ending: WorkflowEnding) -> Option<StreamClose> {
     let close = ending.close?;
     let chain_continues = match close.state() {
         CloseState::Completed => ending.cron,
-        CloseState::Failed => ending.retry_policy,
+        CloseState::Failed => ending.cron || ending.retry_policy,
         _ => false,
     };
     (!chain_continues).then_some(close)
