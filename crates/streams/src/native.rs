@@ -24,6 +24,7 @@ const SERVICE: &str = "temporal.api.nexusservices.streamservice.v1.StreamService
 pub struct NativeBackend {
     connection: Connection,
     namespace: String,
+    commit_mode: bool,
 }
 
 impl NativeBackend {
@@ -31,7 +32,13 @@ impl NativeBackend {
         Self {
             connection,
             namespace: options.namespace,
+            commit_mode: options.commit_mode,
         }
+    }
+
+    /// Whether workflows' own records travel in the workflow task completion.
+    pub fn commit_mode(&self) -> bool {
+        self.commit_mode
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<Vec<Vec<u8>>> {

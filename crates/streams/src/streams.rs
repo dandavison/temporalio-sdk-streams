@@ -8,9 +8,10 @@ use crate::proto::api::{
 };
 use crate::proto::service;
 use crate::redis::RedisBackend;
-use crate::workflow::{Runs, close_for_ending};
+use crate::workflow::{Runs, close_for_ending, commit_mode_messages};
 use prost::Message;
 use temporalio_client::Connection;
+use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 enum Backend {
     Native(NativeBackend),
@@ -53,13 +54,14 @@ impl Streams {
                 .read(api::ReadRequest::decode(request)?)
                 .await?
                 .encode_to_vec(),
-            "WorkflowActivationCompleted" => {
-                self.workflow_activation_completed(WorkflowActivationCompletedRequest::decode(
-                    request,
-                )?)
-                .await?;
-                WorkflowActivationCompletedResponse::default().encode_to_vec()
+            "WorkflowActivationCompleted" => WorkflowActivationCompletedResponse {
+                protocol_messages: self
+                    .workflow_activation_completed(WorkflowActivationCompletedRequest::decode(
+                        request,
+                    )?)
+                    .await?,
             }
+            .encode_to_vec(),
             "WorkflowEvicted" => {
                 self.workflow_evicted(WorkflowEvictedRequest::decode(request)?)
                     .await?;
@@ -90,13 +92,14 @@ impl Streams {
         }
     }
 
-    /// Appends an activation's records, in appends that fit the size limits. If the completion
-    /// ends the run, a Redis stream's close is kept until the eviction that says the server
-    /// accepted it; a native stream is closed by the server.
+    /// Appends an activation's records, in appends that fit the size limits, or in commit mode
+    /// returns them as protocol messages for the activation's completion. If the completion ends
+    /// the run, a Redis stream's close is kept until the eviction that says the server accepted it;
+    /// a native stream is closed by the server.
     async fn workflow_activation_completed(
         &self,
         req: WorkflowActivationCompletedRequest,
-    ) -> Result<()> {
+    ) -> Result<Vec<ProtocolMessage>> {
         let stream = api::StreamRef {
             workflow_id: req.workflow_id,
             first_run_id: req.first_run_id,
@@ -107,6 +110,13 @@ impl Streams {
             attempt: req.attempt,
         };
         let mut run = self.runs.for_task(stream, owner);
+        if let Backend::Native(native) = &self.backend
+            && native.commit_mode()
+        {
+            let messages = commit_mode_messages(&mut run, req.records);
+            self.runs.put(run);
+            return messages;
+        }
         for records in limits::split(req.records)? {
             let appended = self
                 .append(api::AppendRequest {
@@ -129,7 +139,7 @@ impl Streams {
             run.pending_close = close_for_ending(ending);
         }
         self.runs.put(run);
-        Ok(())
+        Ok(vec![])
     }
 
     /// Forgets an evicted run, first writing its pending close if the eviction says the server

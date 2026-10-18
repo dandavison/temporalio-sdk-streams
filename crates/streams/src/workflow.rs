@@ -2,11 +2,13 @@
 //! activation, and with its stream when the run ends.
 
 use crate::error::Result;
+use crate::limits;
 use crate::proto::api::{StreamRef, WorkflowEnding, WorkflowProducer};
-use crate::proto::service::{AppendRecord, CloseState, StreamClose};
-use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
+use crate::proto::service::{AppendRecord, CloseState, CommitModeAppend, StreamClose};
+use prost::{Message, Name};
 use std::collections::HashMap;
 use std::sync::Mutex;
+use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 /// What the worker knows of a run's appends: its current workflow task attempt, the next seq in
 /// that attempt, and a close to write once the server has accepted the run's terminal completion.
@@ -64,16 +66,35 @@ pub fn commit_mode_messages(
     run: &mut Run,
     records: Vec<AppendRecord>,
 ) -> Result<Vec<ProtocolMessage>> {
-    let _ = (run, records);
-    todo!()
+    limits::split(records)?
+        .into_iter()
+        .map(|records| {
+            let owner = &run.owner;
+            let id = format!(
+                "stream/{}/{}/{}/{}",
+                owner.run_id, owner.previous_started_event_id, owner.attempt, run.next_seq
+            );
+            run.next_seq += 1;
+            let append = CommitModeAppend { records };
+            let mut message = ProtocolMessage {
+                id,
+                protocol_instance_id: "stream".into(),
+                body: Some(Default::default()),
+                ..Default::default()
+            };
+            if let Some(body) = message.body.as_mut() {
+                body.type_url = format!("type.googleapis.com/{}", CommitModeAppend::full_name());
+                body.value = append.encode_to_vec();
+            }
+            Ok(message)
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::proto::Payload;
-    use crate::proto::service::CommitModeAppend;
-    use prost::Message;
 
     fn run() -> Run {
         Run {
