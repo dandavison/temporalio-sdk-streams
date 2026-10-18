@@ -1,4 +1,5 @@
-//! The size limits on an append, the same as the native server's.
+//! The size limits on an append, the same as the native server's. Only payload bytes count, as on
+//! the server: topics do not.
 
 use crate::error::{Error, Result};
 use crate::proto::service::{AppendRecord, StreamFailureType};
@@ -28,7 +29,8 @@ pub fn check(records: &[AppendRecord]) -> Result<()> {
     Ok(())
 }
 
-/// Splits records, in order, into appends that each fit the limits.
+/// Splits records, in order, into appends that each fit the limits. A record over the per-record
+/// limit fails the whole split, so nothing is appended.
 pub fn split(records: Vec<AppendRecord>) -> Result<Vec<Vec<AppendRecord>>> {
     let mut appends = vec![];
     let mut current = vec![];

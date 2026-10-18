@@ -12,6 +12,7 @@ pub enum Error {
     /// retry deadline, then reported as [`Error::Unavailable`].
     #[error("transient: {0}")]
     Transient(String),
+    /// A transient failure that lasted past the retry deadline.
     #[error("unavailable: {0}")]
     Unavailable(String),
     #[error("invalid argument: {0}")]

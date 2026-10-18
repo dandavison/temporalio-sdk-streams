@@ -12,7 +12,8 @@ redis = { version = "0.32", features = ["tokio-comp", "script", "connection-mana
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-# sdk-core is used only for its client connection and its protos.
+# sdk-core is used only for its client connection and its protos. sdk-python patches these to its
+# vendored sdk-core, so this rev is used only when the crate is built on its own.
 temporalio-client = { git = "https://github.com/dandavison/temporalio-sdk-core", rev = "fb1593dba5089ea2de73169713a4a1c2944e0014", default-features = false }
 temporalio-protos = { git = "https://github.com/dandavison/temporalio-sdk-core", rev = "fb1593dba5089ea2de73169713a4a1c2944e0014" }
 

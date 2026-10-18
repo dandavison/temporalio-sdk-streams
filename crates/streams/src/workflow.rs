@@ -12,6 +12,7 @@ use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 /// What the worker knows of a run's appends: its current workflow task attempt, the next seq in
 /// that attempt, and a close to write once the server has accepted the run's terminal completion.
+/// Keyed by run ID; an entry is removed when the run is evicted.
 #[derive(Default)]
 pub struct Runs(Mutex<HashMap<String, Run>>);
 
@@ -49,7 +50,9 @@ impl Runs {
 
 /// The close to write when the run ends, or none if its run chain continues: a completed cron run,
 /// or a failed run with a retry policy, which the server may retry. Whether a retry happens is the
-/// server's decision, so a failed run with a retry policy is never closed by the worker.
+/// server's decision, so a failed run with a retry policy is never closed by the worker, even when
+/// the server does not retry it (attempts exhausted, or a non-retryable failure); its stream stays
+/// open until its retention passes.
 pub fn close_for_ending(ending: WorkflowEnding) -> Option<StreamClose> {
     let close = ending.close?;
     let chain_continues = match close.state() {
@@ -61,7 +64,10 @@ pub fn close_for_ending(ending: WorkflowEnding) -> Option<StreamClose> {
 }
 
 /// The records as commit-mode protocol messages, one for each append that fits the size limits,
-/// with IDs unique within the run's workflow task attempt.
+/// with IDs unique within the run's workflow task attempt. The server assigns the appends' seqs
+/// itself; next_seq only makes the IDs unique. Nothing limits the total: all of a workflow task's
+/// messages travel in its one completion, so enough records can exceed the server's request size
+/// limit.
 pub fn commit_mode_messages(
     run: &mut Run,
     records: Vec<AppendRecord>,

@@ -2,27 +2,43 @@
 //! Redis.
 //!
 //! A stream is keyed by its owner: a workflow run chain, by workflow ID and first run ID, or a
-//! Standalone Activity execution, by activity ID and run ID. It is four keys sharing a hash tag with
-//! the owner's kind and ID: a Redis stream holding the log, a hash holding each producer's dedupe
-//! and fencing state, a metadata hash holding existence and close, and a tombstone. A fifth key
-//! names the owner ID's latest run, for readers that do not know the run ID. Every append and close
-//! goes through one Lua script, which checks and writes in one step.
+//! Standalone Activity execution, by activity ID and run ID. The owner's kind is part of the key,
+//! so a workflow and an activity with the same ID have different streams. A stream is four keys
+//! sharing a hash tag with the owner's kind and ID: a Redis stream holding the log, a hash holding
+//! each producer's dedupe and fencing state, a metadata hash holding existence and close, and a
+//! tombstone. A fifth key, with the same hash tag, holds the run of the owner ID that most recently
+//! created a stream, for readers that do not know the run ID. Every append and close goes through
+//! one Lua script, which checks and writes in one step; producers that write to the Redis stream
+//! directly are not supported.
 //!
 //! Every write refreshes the keys' time-to-live, the retention, so a stream that is no longer
-//! written to is removed, closed or not. The tombstone lives twice as long, so for that long a
-//! reader can tell a removed stream from one that never existed.
+//! written to is removed, closed or not; reads do not refresh it. Producer state is removed only
+//! with the stream. The tombstone lives twice as long, so for that long a reader can tell a removed
+//! stream from one that never existed.
 //!
 //! Properties weaker than native, all because Redis cannot see the server's state:
 //! - A stale producer is fenced only once its successor has appended.
 //! - Nothing writes workflow task commit records, so a failed workflow task attempt's records,
 //!   and its local activities', are not withdrawn.
+//! - Appends from speculative workflow tasks are not rejected: neither the worker nor Core can
+//!   tell that a task is speculative.
 //! - Producers are not verified, and anything that can write to Redis can write any key, so the
 //!   owner-only close guards against mistakes, not against other writers.
 //! - The owner's worker writes the close. A stream is left open, until its retention passes, when
 //!   its workflow is terminated or times out, when a failed run with a retry policy is not
 //!   retried, or when the worker stops before writing the close. Until then producers can keep
 //!   appending.
+//! - Nothing closes a Standalone Activity's stream when the activity ends; the activity must close
+//!   it itself. The worker cannot learn whether the server accepted the activity's completion,
+//!   because Core discards the result of the Respond call, or whether a failed attempt will be
+//!   retried, which only the server knows.
 //! - A topic filter is applied after reading: the reader receives every record.
+//! - Redis can acknowledge a write that it then loses: on a restart, unless the append-only file is
+//!   fsynced on every write, or on a failover to a replica that had not received it. The deployment
+//!   check does not check persistence.
+//!
+//! The keys share a hash tag so that one script's keys are in one slot, but the backend connects
+//! with a single-node client, so it does not support Redis Cluster.
 
 use crate::error::{Error, Result};
 use crate::identity::{Identity, identity};
@@ -55,7 +71,7 @@ pub struct RedisBackend {
 }
 
 impl RedisBackend {
-    /// Connects, and checks that the deployment cannot lose stream data silently.
+    /// Connects, and checks that the deployment will not evict stream data.
     pub async fn connect(options: RedisOptions) -> Result<Self> {
         let retention = options
             .retention
@@ -193,8 +209,9 @@ impl RedisBackend {
         self.read_after(conn, &keys, &req, after, deadline).await
     }
 
-    /// Resolves the chain a read from the beginning reads: the pinned one, or the workflow ID's
-    /// latest, waiting until the deadline for one to exist.
+    /// Resolves the chain a read from the beginning reads: the pinned one, or the run of the owner
+    /// ID that most recently created a stream, waiting until the deadline for one to exist. A newer
+    /// run that has not appended yet is not seen.
     async fn resolve_chain(
         &self,
         conn: &mut ConnectionManager,
@@ -239,6 +256,8 @@ impl RedisBackend {
         }
     }
 
+    /// Reads what is there after `last_id`; if there is nothing, blocks for the rest of the wait.
+    /// Entries that the topic filter drops do not end the wait.
     async fn read_after(
         &self,
         mut conn: ConnectionManager,
@@ -286,7 +305,7 @@ impl RedisBackend {
     }
 
     /// Blocks for entries after `last_id`, on a connection of its own, since a blocking command
-    /// would hold up every other command on a shared one.
+    /// would hold up every other command on a shared one. Each call opens a new connection.
     async fn block(
         &self,
         log: &str,
@@ -315,7 +334,8 @@ impl RedisBackend {
             .unwrap_or_default())
     }
 
-    /// Reads the last `req.last` matching records, scanning the log backwards.
+    /// Reads the last `req.last` matching records, scanning the log backwards. It fetches the whole
+    /// log in one reply, however few records it returns.
     async fn read_last(
         &self,
         conn: &mut ConnectionManager,
@@ -358,6 +378,8 @@ impl RedisBackend {
         Ok(after.ids.is_empty())
     }
 
+    /// Runs the append script, retrying transient failures. A retry after the script ran but its
+    /// reply was lost takes the dedupe path and returns the stored entry IDs.
     async fn run_append(
         &self,
         keys: &ChainKeys,
@@ -425,7 +447,8 @@ impl RedisBackend {
         format!("{}:current", self.owner_prefix(owner))
     }
 
-    /// Splits a cursor, `<workflow prefix>:<first run ID>#<entry ID>`, into its chain and entry.
+    /// Splits a cursor, `<owner prefix>:<run ID>#<entry ID>`, into its run and entry. The prefix
+    /// binds the cursor to the namespace and owner.
     fn parse_cursor(&self, owner: &str, cursor: &[u8]) -> Result<(String, String)> {
         let mismatch = || {
             Error::stream(
@@ -459,7 +482,7 @@ impl ChainKeys {
 }
 
 /// Refuses a deployment that is too old for the commands used, or whose eviction policy could
-/// drop stream data.
+/// drop stream data. It checks once, at connect, so a later change of the policy is not detected.
 async fn check_deployment(conn: &mut ConnectionManager) -> Result<()> {
     let server: String = redis::cmd("INFO")
         .arg("server")
@@ -494,6 +517,9 @@ fn info_field<'a>(info: &'a str, field: &str) -> Option<&'a str> {
         .find_map(|line| line.trim().strip_prefix(field)?.strip_prefix(':'))
 }
 
+/// The record of a log entry, or none for the close entry, which readers learn of from the
+/// response's close, or for an entry the topic filter drops. Finish entries have no topic, so a
+/// topic filter drops them, as on native.
 fn record(
     cursor: Vec<u8>,
     fields: &HashMap<String, Value>,
@@ -622,7 +648,8 @@ fn required_run(stream: &StreamRef) -> Result<&str> {
     Ok(run)
 }
 
-/// Classifies a Redis error: a failure the script reports, a transient failure, or another.
+/// Classifies a Redis error: a failure the script reports, as an error whose code is a
+/// StreamFailureType name without its prefix; a transient failure; or another.
 fn redis_error(e: RedisError) -> Error {
     if let Some(code) = e.code()
         && let Some(failure_type) =

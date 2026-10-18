@@ -1,4 +1,5 @@
-//! Bounded retries of transient failures.
+//! Bounded retries of transient failures. The deadline bounds when a retry may start, not how long
+//! one attempt runs, so a call can take longer than the deadline.
 
 use crate::error::{Error, Result};
 use std::future::Future;

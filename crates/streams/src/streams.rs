@@ -39,7 +39,8 @@ impl Streams {
         })
     }
 
-    /// Runs the named call on its encoded request and returns its encoded response.
+    /// Runs the named call on its encoded request and returns its encoded response. The calls and
+    /// their messages are in `protos/temporal/sdk/streams/v1/streams.proto`.
     pub async fn call(&self, name: &str, request: &[u8]) -> Result<Vec<u8>> {
         Ok(match name {
             "Append" => AppendResponse {
@@ -96,6 +97,10 @@ impl Streams {
     /// returns them as protocol messages for the activation's completion. If the completion ends
     /// the run, a Redis stream's close is kept until the eviction that says the server accepted it;
     /// a native stream is closed by the server.
+    ///
+    /// If one of the appends fails, the earlier ones stay stored and the call fails, which fails
+    /// the activation; the workflow task's next attempt appends the records again under its own
+    /// epoch.
     async fn workflow_activation_completed(
         &self,
         req: WorkflowActivationCompletedRequest,
@@ -144,7 +149,9 @@ impl Streams {
     }
 
     /// Forgets an evicted run, first writing its pending close if the eviction says the server
-    /// accepted the run's terminal completion.
+    /// accepted the run's terminal completion. The run is forgotten before the close is written, so
+    /// a close that fails after the retries is not written later, and the stream stays open until
+    /// its retention passes.
     async fn workflow_evicted(&self, req: WorkflowEvictedRequest) -> Result<()> {
         let Some(run) = self.runs.remove(&req.run_id) else {
             return Ok(());

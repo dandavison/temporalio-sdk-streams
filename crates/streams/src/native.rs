@@ -1,7 +1,13 @@
-//! A backend that stores streams in Temporal, embedded in their owning workflows. Every operation is
-//! a direct Nexus call to the stream service on the System Nexus Endpoint, which the server runs in
-//! a transaction on the owning workflow. The server checks activity and workflow producers, records
-//! which attempt completed each workflow task, and closes the stream when the workflow ends.
+//! A backend that stores streams in Temporal, embedded in their owner: a workflow run, or a
+//! Standalone Activity execution. Every operation is a direct Nexus call to the stream service on
+//! the System Nexus Endpoint, which the server runs in a transaction on the owner, so the server
+//! needs CHASM and direct Nexus calls enabled. The server checks the owner's own activity and
+//! workflow task producers, records which attempt completed each of an owning workflow's tasks,
+//! and closes the stream when the owner ends. It does not verify clients, checks a local activity
+//! only by its run, and on an activity-owned stream does not verify any producer but the activity.
+//!
+//! A workflow's stream is not moved to the next run of its chain at continue-as-new, retry or
+//! cron, so the next run starts with a new, empty stream.
 
 use crate::error::{Error, Result};
 use crate::limits;
@@ -106,7 +112,9 @@ impl NativeBackend {
         .await
     }
 
-    /// Makes a direct Nexus call to the stream service, retrying transient failures.
+    /// Makes a direct Nexus call to the stream service, retrying transient failures. Retrying an
+    /// append or close is safe because the stream dedupes a producer's latest seq; the call sets no
+    /// request ID, and the server does not dedupe calls.
     async fn call<Req: Message + Name, Resp: Message + Default>(
         &self,
         operation: &str,
@@ -211,6 +219,9 @@ fn operation_error(failure: Failure) -> Error {
     Error::Internal(format!("stream operation failed: {}", failure.message))
 }
 
+/// Classifies a gRPC error. A missing stream or owner arrives as an operation failure, not as
+/// gRPC NotFound, which comes from the frontend, for example for an unknown namespace; it is still
+/// reported as NOT_FOUND.
 fn status_error(status: tonic::Status) -> Error {
     match status.code() {
         Code::Unavailable | Code::DeadlineExceeded | Code::ResourceExhausted | Code::Aborted => {

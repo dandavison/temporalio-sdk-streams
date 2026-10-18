@@ -1,4 +1,7 @@
-//! The stored identity of a producer, which both backends store with every record.
+//! The stored identity of a producer, which the Redis backend stores with every record. The native
+//! server derives the same identity itself, with the same producer strings, so readers handle
+//! records from either backend the same way. On Redis nothing is verified: an activity's IDs and
+//! stamp are taken from the request, not from its task token.
 
 use crate::error::{Error, Result};
 use crate::proto::api::{Producer, producer::Variant};
