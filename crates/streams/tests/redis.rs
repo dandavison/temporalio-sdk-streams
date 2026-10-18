@@ -8,8 +8,8 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use temporalio_streams::proto::Payload;
 use temporalio_streams::proto::api::{
-    AppendRequest, AppendResponse, ClientProducer, CloseRequest, CloseResponse, Producer,
-    ReadRequest, RedisOptions, StreamRef, WorkflowActivationCompletedRequest,
+    ActivityProducer, AppendRequest, AppendResponse, ClientProducer, CloseRequest, CloseResponse,
+    Producer, ReadRequest, RedisOptions, StreamRef, WorkflowActivationCompletedRequest,
     WorkflowActivationCompletedResponse, WorkflowEnding, WorkflowEvictedRequest,
     WorkflowEvictedResponse, WorkflowProducer, producer::Variant,
 };
@@ -101,6 +101,24 @@ fn stream(first_run_id: &str) -> StreamRef {
     StreamRef {
         workflow_id: "wf".into(),
         first_run_id: first_run_id.into(),
+        ..Default::default()
+    }
+}
+
+fn activity_stream(activity_id: &str, run_id: &str) -> StreamRef {
+    StreamRef {
+        activity_id: activity_id.into(),
+        activity_run_id: run_id.into(),
+        ..Default::default()
+    }
+}
+
+fn activity_producer(activity_id: &str, run_id: &str, attempt_stamp: i32) -> ActivityProducer {
+    ActivityProducer {
+        activity_id: activity_id.into(),
+        activity_run_id: run_id.into(),
+        attempt_stamp,
+        ..Default::default()
     }
 }
 
@@ -300,6 +318,7 @@ async fn streams_are_keyed_by_run_chain() {
         CloseRequest {
             stream: Some(stream("run-1")),
             owner: Some(owner(3, 1)),
+            activity_owner: None,
             seq: 0,
             close: Some(StreamClose {
                 state: CloseState::Completed.into(),
@@ -505,4 +524,78 @@ async fn continuing_chain_is_not_closed() {
             "{state:?} cron={cron} retry_policy={retry_policy}"
         );
     }
+}
+
+#[tokio::test]
+async fn activity_owned_stream_is_keyed_apart_from_a_workflow_with_the_same_id() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    append(&s, "run-1", client(1), 0, &["workflow"])
+        .await
+        .unwrap();
+    let resp: AppendResponse = call(
+        &s,
+        "Append",
+        AppendRequest {
+            stream: Some(activity_stream("wf", "act-run")),
+            producer: Some(Producer {
+                variant: Some(Variant::Activity(activity_producer("wf", "act-run", 1))),
+            }),
+            seq: 0,
+            records: records(&["activity"]),
+            finish: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(resp.cursors.len(), 1);
+    assert_eq!(
+        values(&read(&s, activity_stream("wf", ""), vec![]).await.unwrap()),
+        ["activity"]
+    );
+    assert_eq!(
+        values(&read(&s, stream(""), vec![]).await.unwrap()),
+        ["workflow"]
+    );
+    assert_eq!(
+        failure_type(read(&s, stream("run-1"), resp.cursors[0].clone()).await),
+        StreamFailureType::CursorMismatch
+    );
+}
+
+#[tokio::test]
+async fn only_the_owning_activity_closes_its_stream() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let close =
+        |owner: Option<WorkflowProducer>, activity_owner: Option<ActivityProducer>| CloseRequest {
+            stream: Some(activity_stream("act", "act-run")),
+            owner,
+            activity_owner,
+            seq: 0,
+            close: Some(StreamClose {
+                state: CloseState::Completed.into(),
+                ..Default::default()
+            }),
+        };
+    for (owner, activity_owner) in [
+        (Some(owner(3, 1)), None),
+        (None, Some(activity_producer("other", "act-run", 1))),
+    ] {
+        assert_eq!(
+            failure_type(call::<CloseResponse>(&s, "Close", close(owner, activity_owner)).await),
+            StreamFailureType::NotOwner
+        );
+    }
+    let _: CloseResponse = call(
+        &s,
+        "Close",
+        close(None, Some(activity_producer("act", "act-run", 1))),
+    )
+    .await
+    .unwrap();
+    let resp = read(&s, activity_stream("act", "act-run"), vec![])
+        .await
+        .unwrap();
+    assert_eq!(resp.close.unwrap().state(), CloseState::Completed);
 }

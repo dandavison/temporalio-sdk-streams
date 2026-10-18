@@ -103,6 +103,7 @@ impl Streams {
         let stream = api::StreamRef {
             workflow_id: req.workflow_id,
             first_run_id: req.first_run_id,
+            ..Default::default()
         };
         let owner = WorkflowProducer {
             run_id: req.run_id,
@@ -156,6 +157,7 @@ impl Streams {
             owner: Some(run.owner),
             seq: run.next_seq,
             close: Some(close),
+            activity_owner: None,
         })
         .await
     }

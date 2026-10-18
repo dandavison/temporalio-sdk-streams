@@ -1,11 +1,12 @@
 //! A backend that stores streams in Redis, as a worker or client does. The server never talks to
 //! Redis.
 //!
-//! A run chain's stream is four keys sharing a hash tag with its workflow ID: a Redis stream
-//! holding the log, a hash holding each producer's dedupe and fencing state, a metadata hash
-//! holding existence and close, and a tombstone. A fifth key names the workflow ID's latest chain,
-//! for readers that do not know the first run ID. Every append and close goes through one Lua
-//! script, which checks and writes in one step.
+//! A stream is keyed by its owner: a workflow run chain, by workflow ID and first run ID, or a
+//! Standalone Activity execution, by activity ID and run ID. It is four keys sharing a hash tag with
+//! the owner's kind and ID: a Redis stream holding the log, a hash holding each producer's dedupe
+//! and fencing state, a metadata hash holding existence and close, and a tombstone. A fifth key
+//! names the owner ID's latest run, for readers that do not know the run ID. Every append and close
+//! goes through one Lua script, which checks and writes in one step.
 //!
 //! Every write refreshes the keys' time-to-live, the retention, so a stream that is no longer
 //! written to is removed, closed or not. The tombstone lives twice as long, so for that long a
@@ -26,7 +27,9 @@
 use crate::error::{Error, Result};
 use crate::identity::{Identity, identity};
 use crate::limits;
-use crate::proto::api::{AppendRequest, CloseRequest, ReadRequest, RedisOptions, StreamRef};
+use crate::proto::api::{
+    AppendRequest, CloseRequest, Producer, ReadRequest, RedisOptions, StreamRef, producer::Variant,
+};
 use crate::proto::service::{self, ProducerIdentity, Record, StreamClose, StreamFailureType};
 use crate::proto::{Failure, Payload};
 use crate::retry::with_retries;
@@ -96,7 +99,7 @@ impl RedisBackend {
         if req.finish {
             entries.push(vec![("kind", b"finish".to_vec())]);
         }
-        let keys = self.chain_keys(&stream.workflow_id, required_first_run(stream)?);
+        let keys = self.chain_keys(&owner_key(stream), required_run(stream)?);
         let ids = self
             .run_append(&keys, &id, req.seq, &entries, false)
             .await?;
@@ -109,15 +112,25 @@ impl RedisBackend {
 
     pub async fn close(&self, req: CloseRequest) -> Result<()> {
         let stream = stream_ref(&req.stream)?;
-        let owner = req.owner.ok_or_else(|| {
-            Error::stream(
-                StreamFailureType::NotOwner,
-                "only the stream's owner may close it",
-            )
-        })?;
+        let owner = match (req.owner, req.activity_owner) {
+            (Some(w), None) if stream.activity_id.is_empty() => Variant::Workflow(w),
+            (None, Some(a))
+                if a.workflow_run_id.is_empty()
+                    && a.activity_id == stream.activity_id
+                    && a.activity_run_id == stream.activity_run_id =>
+            {
+                Variant::Activity(a)
+            }
+            _ => {
+                return Err(Error::stream(
+                    StreamFailureType::NotOwner,
+                    "only the stream's owner may close it",
+                ));
+            }
+        };
         let close = req.close.unwrap_or_default();
-        let id = identity(&crate::proto::api::Producer {
-            variant: Some(crate::proto::api::producer::Variant::Workflow(owner)),
+        let id = identity(&Producer {
+            variant: Some(owner),
         })?;
         let entry = vec![
             ("kind", b"close".to_vec()),
@@ -128,7 +141,7 @@ impl RedisBackend {
             ),
             ("reason", close.reason.into_bytes()),
         ];
-        let keys = self.chain_keys(&stream.workflow_id, required_first_run(stream)?);
+        let keys = self.chain_keys(&owner_key(stream), required_run(stream)?);
         self.run_append(&keys, &id, req.seq, &[entry], true).await?;
         Ok(())
     }
@@ -147,14 +160,15 @@ impl RedisBackend {
                 None => return Ok(service::ReadResponse::default()),
             }
         } else {
-            let (first_run, entry_id) = self.parse_cursor(&stream.workflow_id, &req.after)?;
-            if !stream.first_run_id.is_empty() && stream.first_run_id != first_run {
+            let (first_run, entry_id) = self.parse_cursor(&owner_key(stream), &req.after)?;
+            let run = owner_run(stream);
+            if !run.is_empty() && run != first_run {
                 return Err(Error::stream(
                     StreamFailureType::CursorMismatch,
                     "the cursor belongs to another run chain",
                 ));
             }
-            (self.chain_keys(&stream.workflow_id, &first_run), entry_id)
+            (self.chain_keys(&owner_key(stream), &first_run), entry_id)
         };
         if !exists(&mut conn, &keys.meta).await? {
             if exists(&mut conn, &keys.tombstone).await? {
@@ -187,16 +201,15 @@ impl RedisBackend {
         stream: &StreamRef,
         deadline: Instant,
     ) -> Result<Option<ChainKeys>> {
-        if !stream.first_run_id.is_empty() {
-            return Ok(Some(
-                self.chain_keys(&stream.workflow_id, &stream.first_run_id),
-            ));
+        let owner = owner_key(stream);
+        if !owner_run(stream).is_empty() {
+            return Ok(Some(self.chain_keys(&owner, owner_run(stream))));
         }
-        let current = self.current_key(&stream.workflow_id);
+        let current = self.current_key(&owner);
         loop {
             let first_run: Option<String> = conn.get(&current).await.map_err(redis_error)?;
             if let Some(first_run) = first_run {
-                return Ok(Some(self.chain_keys(&stream.workflow_id, &first_run)));
+                return Ok(Some(self.chain_keys(&owner, &first_run)));
             }
             if Instant::now() + CHAIN_POLL_INTERVAL > deadline {
                 return Ok(None);
@@ -391,29 +404,29 @@ impl RedisBackend {
         .await
     }
 
-    fn chain_keys(&self, workflow_id: &str, first_run: &str) -> ChainKeys {
-        let prefix = format!("{}:{first_run}", self.workflow_prefix(workflow_id));
+    fn chain_keys(&self, owner: &str, first_run: &str) -> ChainKeys {
+        let prefix = format!("{}:{first_run}", self.owner_prefix(owner));
         ChainKeys {
             meta: format!("{prefix}:meta"),
             log: format!("{prefix}:log"),
             producers: format!("{prefix}:producers"),
             tombstone: format!("{prefix}:tombstone"),
-            current: self.current_key(workflow_id),
+            current: self.current_key(owner),
             first_run: first_run.to_string(),
             prefix,
         }
     }
 
-    fn workflow_prefix(&self, workflow_id: &str) -> String {
-        format!("stream:{{{}/{workflow_id}}}", self.namespace)
+    fn owner_prefix(&self, owner: &str) -> String {
+        format!("stream:{{{}/{owner}}}", self.namespace)
     }
 
-    fn current_key(&self, workflow_id: &str) -> String {
-        format!("{}:current", self.workflow_prefix(workflow_id))
+    fn current_key(&self, owner: &str) -> String {
+        format!("{}:current", self.owner_prefix(owner))
     }
 
     /// Splits a cursor, `<workflow prefix>:<first run ID>#<entry ID>`, into its chain and entry.
-    fn parse_cursor(&self, workflow_id: &str, cursor: &[u8]) -> Result<(String, String)> {
+    fn parse_cursor(&self, owner: &str, cursor: &[u8]) -> Result<(String, String)> {
         let mismatch = || {
             Error::stream(
                 StreamFailureType::CursorMismatch,
@@ -423,7 +436,7 @@ impl RedisBackend {
         let cursor = std::str::from_utf8(cursor).map_err(|_| mismatch())?;
         let (chain, entry_id) = cursor.rsplit_once('#').ok_or_else(mismatch)?;
         let first_run = chain
-            .strip_prefix(&format!("{}:", self.workflow_prefix(workflow_id)))
+            .strip_prefix(&format!("{}:", self.owner_prefix(owner)))
             .ok_or_else(mismatch)?;
         Ok((first_run.to_string(), entry_id.to_string()))
     }
@@ -570,17 +583,43 @@ fn digest(entries: &[Vec<(&str, Vec<u8>)>]) -> String {
 fn stream_ref(stream: &Option<StreamRef>) -> Result<&StreamRef> {
     stream
         .as_ref()
-        .filter(|s| !s.workflow_id.is_empty())
-        .ok_or_else(|| Error::InvalidArgument("stream workflow ID is required".into()))
+        .filter(|s| s.workflow_id.is_empty() != s.activity_id.is_empty())
+        .ok_or_else(|| {
+            Error::InvalidArgument(
+                "a stream is named by exactly one of a workflow ID and an activity ID".into(),
+            )
+        })
 }
 
-fn required_first_run(stream: &StreamRef) -> Result<&str> {
-    if stream.first_run_id.is_empty() {
+/// Names a stream's owner, so that a workflow and an activity with the same ID have different
+/// streams.
+fn owner_key(stream: &StreamRef) -> String {
+    if stream.activity_id.is_empty() {
+        format!("workflow/{}", stream.workflow_id)
+    } else {
+        format!("activity/{}", stream.activity_id)
+    }
+}
+
+/// The run ID that pins a stream: a workflow's first run ID, or the activity's run ID.
+fn owner_run(stream: &StreamRef) -> &str {
+    if stream.activity_id.is_empty() {
+        &stream.first_run_id
+    } else {
+        &stream.activity_run_id
+    }
+}
+
+fn required_run(stream: &StreamRef) -> Result<&str> {
+    let run = owner_run(stream);
+    if run.is_empty() {
         return Err(Error::InvalidArgument(
-            "appends to a Redis stream need the first run ID of the stream's run chain".into(),
+            "appends to a Redis stream need the run ID of its owner: a workflow's first run ID, or \
+             the activity's run ID"
+                .into(),
         ));
     }
-    Ok(&stream.first_run_id)
+    Ok(run)
 }
 
 /// Classifies a Redis error: a failure the script reports, a transient failure, or another.

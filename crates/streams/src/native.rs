@@ -59,24 +59,32 @@ impl NativeBackend {
     }
 
     pub async fn close(&self, req: CloseRequest) -> Result<()> {
-        let owner = req.owner.ok_or_else(|| {
-            Error::stream(
-                StreamFailureType::NotOwner,
-                "only the stream's owner may close it",
-            )
-        })?;
+        let (owner, activity_task_token) = match (req.owner, req.activity_owner) {
+            (Some(w), None) => (
+                Some(service::WorkflowTaskProducer {
+                    run_id: w.run_id,
+                    previous_started_event_id: w.previous_started_event_id,
+                    attempt: w.attempt,
+                }),
+                vec![],
+            ),
+            (None, Some(a)) => (None, a.task_token),
+            _ => {
+                return Err(Error::stream(
+                    StreamFailureType::NotOwner,
+                    "only the stream's owner may close it",
+                ));
+            }
+        };
         let _: service::CloseResponse = self
             .call(
                 "Close",
                 &service::CloseRequest {
                     stream: service_ref(req.stream),
-                    owner: Some(service::WorkflowTaskProducer {
-                        run_id: owner.run_id,
-                        previous_started_event_id: owner.previous_started_event_id,
-                        attempt: owner.attempt,
-                    }),
+                    owner,
                     seq: req.seq,
                     close: req.close,
+                    activity_task_token,
                 },
             )
             .await?;
@@ -151,6 +159,8 @@ fn service_ref(stream: Option<api::StreamRef>) -> Option<service::StreamRef> {
     stream.map(|s| service::StreamRef {
         workflow_id: s.workflow_id,
         first_run_id: s.first_run_id,
+        activity_id: s.activity_id,
+        activity_run_id: s.activity_run_id,
         namespace: String::new(),
     })
 }
