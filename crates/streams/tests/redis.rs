@@ -325,6 +325,27 @@ async fn epochs_and_seqs_outside_exact_integers_are_rejected() {
 }
 
 #[tokio::test]
+async fn epochs_and_seqs_compare_as_numbers_across_a_digit_count() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    for seq in 0..=10 {
+        append(&s, "run-1", client(9), seq, &["a"]).await.unwrap();
+    }
+    assert_eq!(
+        failure_type(append(&s, "run-1", client(9), 9, &["a"]).await),
+        StreamFailureType::SeqStale
+    );
+    append(&s, "run-1", client(10), 0, &["b"]).await.unwrap();
+    assert_eq!(
+        failure_type(append(&s, "run-1", client(9), 11, &["c"]).await),
+        StreamFailureType::EpochFenced
+    );
+    let resp = read(&s, stream("run-1"), vec![]).await.unwrap();
+    let last = resp.records.last().unwrap().producer.as_ref().unwrap();
+    assert_eq!((last.epoch, last.seq), (10, 0));
+}
+
+#[tokio::test]
 async fn tail_read_reports_close() {
     let server = RedisServer::start(&[]).await;
     let s = connect(&server).await.unwrap();
