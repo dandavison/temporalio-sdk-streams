@@ -649,8 +649,11 @@ fn required_run(stream: &StreamRef) -> Result<&str> {
 }
 
 /// Classifies a Redis error: a failure the script reports, as an error whose code is a
-/// StreamFailureType name without its prefix; a transient failure; or another.
+/// StreamFailureType name without its prefix, or INVALID_ARGUMENT; a transient failure; or another.
 fn redis_error(e: RedisError) -> Error {
+    if e.code() == Some("INVALID_ARGUMENT") {
+        return Error::InvalidArgument(e.detail().unwrap_or_default().to_string());
+    }
     if let Some(code) = e.code()
         && let Some(failure_type) =
             StreamFailureType::from_str_name(&format!("STREAM_FAILURE_TYPE_{code}"))

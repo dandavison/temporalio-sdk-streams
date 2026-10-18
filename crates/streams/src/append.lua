@@ -3,9 +3,9 @@
 -- entry written to the log directly bypasses all of these checks. The Go Redis test backend runs a
 -- copy of this file, which must stay identical.
 --
--- Epochs, seqs and workflow task IDs are Lua numbers (doubles), and cjson stores them with 14
--- significant digits, so values with more than 14 digits, such as a client epoch taken from a
--- nanosecond clock, are compared wrongly.
+-- Workflow tasks, workflow task attempts, epochs and seqs must be integers from 0 to 2^53-1, which
+-- Lua numbers (doubles) hold exactly; anything else is rejected. They are compared as numbers, and
+-- stored as the decimal strings received, because cjson encodes numbers with 14 significant digits.
 --
 -- KEYS: meta, log, producers, tombstone, current (the run of the owner ID that most recently
 -- created a stream).
@@ -18,6 +18,12 @@ local first_run, producer, run = ARGV[1], ARGV[2], ARGV[3]
 local wt, wta, epoch, seq = tonumber(ARGV[4]), tonumber(ARGV[5]), tonumber(ARGV[6]), tonumber(ARGV[7])
 local digest, closing, retention = ARGV[8], ARGV[9] == '1', tonumber(ARGV[10])
 
+for _, v in ipairs({wt, wta, epoch, seq}) do
+  if not v or v < 0 or v > 9007199254740991 or v ~= math.floor(v) then
+    return redis.error_reply('INVALID_ARGUMENT workflow tasks, epochs and seqs must be integers from 0 to 2^53-1')
+  end
+end
+
 -- A removed stream stays removed while its tombstone lives, rather than starting again empty under
 -- the same keys.
 local exists = redis.call('EXISTS', meta) == 1
@@ -26,9 +32,10 @@ if not exists and redis.call('EXISTS', tombstone) == 1 then
 end
 
 local function compare(st)
-  if wt ~= st.wt then return wt < st.wt and -1 or 1 end
-  if wta ~= st.wta then return wta < st.wta and -1 or 1 end
-  if epoch ~= st.epoch then return epoch < st.epoch and -1 or 1 end
+  local st_wt, st_wta, st_epoch = tonumber(st.wt), tonumber(st.wta), tonumber(st.epoch)
+  if wt ~= st_wt then return wt < st_wt and -1 or 1 end
+  if wta ~= st_wta then return wta < st_wta and -1 or 1 end
+  if epoch ~= st_epoch then return epoch < st_epoch and -1 or 1 end
   return 0
 end
 
@@ -43,16 +50,17 @@ if raw then
     return redis.error_reply('EPOCH_FENCED producer has appended at a higher epoch')
   end
   if c == 0 then
-    if seq == st.seq then
+    local st_seq = tonumber(st.seq)
+    if seq == st_seq then
       if digest == st.digest then
         return st.ids
       end
       return redis.error_reply('SEQ_DIVERGENT seq is stored with different content')
     end
-    if seq < st.seq then
+    if seq < st_seq then
       return redis.error_reply('SEQ_STALE seq is lower than the latest')
     end
-    next_seq = st.seq + 1
+    next_seq = st_seq + 1
   end
 end
 if seq ~= next_seq then
@@ -69,8 +77,8 @@ local i = 12
 for _ = 1, tonumber(ARGV[11]) do
   local nfields = tonumber(ARGV[i])
   i = i + 1
-  local args = {'XADD', log, '*', 'producer', producer, 'run', run, 'wt', wt, 'wta', wta,
-    'epoch', epoch, 'seq', seq}
+  local args = {'XADD', log, '*', 'producer', producer, 'run', run, 'wt', ARGV[4], 'wta', ARGV[5],
+    'epoch', ARGV[6], 'seq', ARGV[7]}
   for j = 0, 2 * nfields - 1 do
     args[#args + 1] = ARGV[i + j]
     -- A close's fields are copied into meta, so a reader finds the close without scanning the log.
@@ -82,7 +90,7 @@ for _ = 1, tonumber(ARGV[11]) do
   ids[#ids + 1] = redis.call(unpack(args))
 end
 redis.call('HSET', producers, producer,
-  cjson.encode({wt = wt, wta = wta, epoch = epoch, seq = seq, digest = digest, ids = ids}))
+  cjson.encode({wt = ARGV[4], wta = ARGV[5], epoch = ARGV[6], seq = ARGV[7], digest = digest, ids = ids}))
 redis.call('HSET', meta, 'exists', '1')
 if closing then
   redis.call('HSET', meta, 'closed', '1')
