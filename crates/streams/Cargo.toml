@@ -1,0 +1,23 @@
+[package]
+name = "temporalio-streams"
+version = "0.1.0"
+edition = "2024"
+description = "Prototype: stream backends shared by Temporal SDKs"
+license = "MIT"
+
+[dependencies]
+prost = "0.14"
+prost-types = "0.14"
+redis = { version = "0.32", features = ["tokio-comp", "script", "connection-manager"] }
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+# sdk-core is used only for its client connection and its protos.
+temporalio-client = { git = "https://github.com/dandavison/temporalio-sdk-core", rev = "fb1593dba5089ea2de73169713a4a1c2944e0014", default-features = false }
+temporalio-protos = { git = "https://github.com/dandavison/temporalio-sdk-core", rev = "fb1593dba5089ea2de73169713a4a1c2944e0014" }
+
+[build-dependencies]
+prost-build = "0.14"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
