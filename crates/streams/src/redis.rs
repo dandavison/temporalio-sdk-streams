@@ -26,7 +26,8 @@
 //!   owner-only close guards against mistakes, not against other writers.
 //! - The owner's worker writes the close. A stream is left open, until its retention passes, when
 //!   its workflow is terminated or times out, when a failed run with a retry policy is not
-//!   retried, or when the worker stops before writing the close. Until then producers can keep
+//!   retried (native closes it, because the server knows its retries are exhausted), or when the
+//!   worker stops before writing the close. Until then producers can keep
 //!   appending.
 //! - Nothing closes a Standalone Activity's stream when the activity ends; the activity must close
 //!   it itself. The worker cannot learn whether the server accepted the activity's completion,
