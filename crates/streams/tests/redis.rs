@@ -304,6 +304,63 @@ async fn seq_must_follow_the_latest_in_its_epoch() {
 }
 
 #[tokio::test]
+async fn epochs_and_seqs_outside_exact_integers_are_rejected() {
+    const MAX: i64 = (1 << 53) - 1;
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    append(&s, "run-1", client(MAX), 0, &["a"]).await.unwrap();
+    append(&s, "run-1", client(MAX), 1, &["b"]).await.unwrap();
+    let resp = read(&s, stream("run-1"), vec![]).await.unwrap();
+    assert_eq!(values(&resp), ["a", "b"]);
+    assert_eq!(resp.records[1].producer.as_ref().unwrap().epoch, MAX);
+    for (epoch, seq) in [(MAX + 1, 0), (-1, 0), (1, MAX + 1)] {
+        assert!(
+            matches!(
+                append(&s, "run-2", client(epoch), seq, &["c"]).await,
+                Err(Error::InvalidArgument(_))
+            ),
+            "epoch {epoch} seq {seq}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tail_read_reports_close() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    append(&s, "run-1", client(1), 0, &["a"]).await.unwrap();
+    let _: CloseResponse = call(
+        &s,
+        "Close",
+        CloseRequest {
+            stream: Some(stream("run-1")),
+            owner: Some(owner(3, 1)),
+            activity_owner: None,
+            seq: 0,
+            close: Some(StreamClose {
+                state: CloseState::Completed.into(),
+                ..Default::default()
+            }),
+        },
+    )
+    .await
+    .unwrap();
+    let resp: ReadResponse = call(
+        &s,
+        "Read",
+        ReadRequest {
+            stream: Some(stream("run-1")),
+            last: 1,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(values(&resp), ["a"]);
+    assert_eq!(resp.close.unwrap().state(), CloseState::Completed);
+}
+
+#[tokio::test]
 async fn streams_are_keyed_by_run_chain() {
     let server = RedisServer::start(&[]).await;
     let s = connect(&server).await.unwrap();
@@ -507,6 +564,7 @@ async fn close_is_written_only_after_an_ending_eviction() {
 async fn continuing_chain_is_not_closed() {
     for (state, cron, retry_policy) in [
         (CloseState::Completed, true, false),
+        (CloseState::Failed, true, false),
         (CloseState::Failed, false, true),
     ] {
         let server = RedisServer::start(&[]).await;
