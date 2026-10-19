@@ -40,28 +40,42 @@
 //!
 //! The keys share a hash tag so that one script's keys are in one slot, but the backend connects
 //! with a single-node client, so it does not support Redis Cluster.
+//!
+//! Workflow readers wait on the owner's notifier in the Temporal server, which producers wake with
+//! Notify after appending (see [`Coalescer`] for writers; the worker sends a workflow's own). A
+//! reader loses a wake-up if a producer stops between an append and its Notify, or if a writer's
+//! Notify fails after its retries until its next append.
 
 use crate::error::{Error, Result};
 use crate::identity::{Identity, identity};
 use crate::limits;
+use crate::native::NativeBackend;
+use crate::notify::Coalescer;
 use crate::proto::api::{
-    AppendRequest, CloseRequest, Producer, ReadRequest, RedisOptions, StreamRef, producer::Variant,
+    AppendRequest, CloseRequest, NativeOptions, Producer, ReadRequest, RedisOptions, StreamRef,
+    WorkflowReadResponse, producer::Variant,
 };
-use crate::proto::service::{self, ProducerIdentity, Record, StreamClose, StreamFailureType};
+use crate::proto::service::{
+    self, ProducerIdentity, Record, StreamClose, StreamFailureType, StreamMode,
+};
 use crate::proto::{Failure, Payload};
 use crate::retry::with_retries;
+use crate::streams::records_digest;
 use prost::Message;
 use redis::aio::{ConnectionManager, MultiplexedConnection};
 use redis::streams::{StreamRangeReply, StreamReadOptions, StreamReadReply};
 use redis::{AsyncCommands, Client, ErrorKind, RedisError, Script, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
+use temporalio_client::Connection;
 use tokio::time::{Instant, sleep};
 
 const DEFAULT_MAX_RECORDS: usize = 1000;
 const MIN_VERSION: (u32, u32) = (6, 2);
 const CHAIN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const NOTIFY_INTERVAL: Duration = Duration::from_millis(100);
 
 pub struct RedisBackend {
     client: Client,
@@ -69,11 +83,15 @@ pub struct RedisBackend {
     namespace: String,
     retention: Duration,
     script: Script,
+    /// The Temporal server, for the owners' notifiers.
+    server: Option<NativeBackend>,
+    writers: Option<Arc<Coalescer>>,
 }
 
 impl RedisBackend {
-    /// Connects, and checks that the deployment will not evict stream data.
-    pub async fn connect(options: RedisOptions) -> Result<Self> {
+    /// Connects, and checks that the deployment will not evict stream data. Without a connection to
+    /// the Temporal server, producers send no Notify and workflow reads cannot wait.
+    pub async fn connect(options: RedisOptions, connection: Option<Connection>) -> Result<Self> {
         let retention = options
             .retention
             .and_then(|d| Duration::try_from(d).ok())
@@ -86,13 +104,130 @@ impl RedisBackend {
         })
         .await?;
         check_deployment(&mut conn).await?;
+        let server = connection.map(|c| {
+            NativeBackend::new(
+                c,
+                NativeOptions {
+                    namespace: options.namespace.clone(),
+                },
+            )
+        });
+        let writers = server.clone().map(|server| {
+            Coalescer::new(
+                NOTIFY_INTERVAL,
+                Arc::new(move |stream| {
+                    let server = server.clone();
+                    Box::pin(async move { server.notify(&stream, true).await })
+                }),
+            )
+        });
         Ok(Self {
             client,
             conn,
             namespace: options.namespace,
             retention,
             script: Script::new(include_str!("append.lua")),
+            server,
+            writers,
         })
+    }
+
+    /// Notifies the stream's owner after an activity's or a client's write, coalesced per stream.
+    pub fn writer_appended(&self, stream: &Option<StreamRef>) {
+        if let (Some(writers), Some(stream)) = (&self.writers, stream) {
+            writers.appended(stream);
+        }
+    }
+
+    /// Notifies the stream's owner after a workflow's own writes, once, without retries. A failure
+    /// is logged; the run's next write notifies again.
+    pub async fn workflow_appended(&self, stream: &StreamRef) {
+        if let Some(server) = &self.server
+            && let Err(e) = server.notify(stream, false).await
+        {
+            tracing::warn!(error = %e, ?stream, "Notify after a workflow's stream writes failed");
+        }
+    }
+
+    /// Reads; if the read returns no records and no close and `notifier` is set, reads the owner's
+    /// notifier state and then reads again, so that a Wait at that position misses no Notify: an
+    /// append either is stored before the second read, which returns it, or its Notify moves the
+    /// position after it was read.
+    pub async fn workflow_read(
+        &self,
+        req: ReadRequest,
+        notifier: bool,
+    ) -> Result<WorkflowReadResponse> {
+        let first = self.read(req.clone()).await?;
+        if !notifier || !first.records.is_empty() || first.close.is_some() {
+            return Ok(read_response(first));
+        }
+        let server = self.server.as_ref().ok_or_else(|| {
+            Error::InvalidArgument(
+                "a workflow read of a Redis stream needs a connection to the Temporal server"
+                    .into(),
+            )
+        })?;
+        let mut stream = stream_ref(&req.stream)?.clone();
+        let cursor = if first.cursor.is_empty() {
+            req.after.clone()
+        } else {
+            first.cursor.clone()
+        };
+        let Some(run) = self.owner_run(server, &stream, &cursor).await? else {
+            return Ok(WorkflowReadResponse {
+                owner_not_found: true,
+                ..read_response(first)
+            });
+        };
+        if stream.activity_id.is_empty() {
+            stream.first_run_id = run.clone();
+        } else {
+            stream.activity_run_id = run.clone();
+        }
+        let state = server.notifier_state(&stream).await?;
+        let second = self
+            .read(ReadRequest {
+                stream: Some(stream),
+                after: cursor,
+                ..req
+            })
+            .await?;
+        if !second.records.is_empty() || second.close.is_some() {
+            return Ok(read_response(second));
+        }
+        Ok(WorkflowReadResponse {
+            notifier: Some(state),
+            owner_run_id: run,
+            ..read_response(second)
+        })
+    }
+
+    /// The run that names the stream's owner: the reference's, the cursor's, the owner ID's latest
+    /// stream's, or the owner's current one, which the server is asked for. None if the owner does
+    /// not exist.
+    async fn owner_run(
+        &self,
+        server: &NativeBackend,
+        stream: &StreamRef,
+        cursor: &[u8],
+    ) -> Result<Option<String>> {
+        if !owner_run(stream).is_empty() {
+            return Ok(Some(owner_run(stream).to_string()));
+        }
+        let owner = owner_key(stream);
+        if !cursor.is_empty() {
+            return Ok(Some(self.parse_cursor(&owner, cursor)?.0));
+        }
+        let mut conn = self.conn.clone();
+        let current: Option<String> = conn
+            .get(self.current_key(&owner))
+            .await
+            .map_err(redis_error)?;
+        match current {
+            Some(run) => Ok(Some(run)),
+            None => server.owner_run(stream).await,
+        }
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<Vec<Vec<u8>>> {
@@ -174,7 +309,7 @@ impl RedisBackend {
         let (keys, after) = if req.after.is_empty() {
             match self.resolve_chain(&mut conn, stream, deadline).await? {
                 Some(keys) => (keys, "0-0".to_string()),
-                None => return Ok(service::ReadResponse::default()),
+                None => return Ok(self.response()),
             }
         } else {
             let (first_run, entry_id) = self.parse_cursor(&owner_key(stream), &req.after)?;
@@ -186,6 +321,18 @@ impl RedisBackend {
                 ));
             }
             (self.chain_keys(&owner_key(stream), &first_run), entry_id)
+        };
+        let until = if req.until.is_empty() {
+            None
+        } else {
+            let (first_run, entry_id) = self.parse_cursor(&owner_key(stream), &req.until)?;
+            if first_run != keys.first_run {
+                return Err(Error::stream(
+                    StreamFailureType::CursorMismatch,
+                    "the cursors belong to different run chains",
+                ));
+            }
+            Some(entry_id)
         };
         if !exists(&mut conn, &keys.meta).await? {
             if exists(&mut conn, &keys.tombstone).await? {
@@ -207,7 +354,18 @@ impl RedisBackend {
         if req.last > 0 {
             return self.read_last(&mut conn, &keys, &req).await;
         }
-        self.read_after(conn, &keys, &req, after, deadline).await
+        self.read_after(conn, &keys, &req, after, until, deadline)
+            .await
+    }
+
+    /// An empty response: a Redis stream is always sink-mode, and its data is kept for the
+    /// retention after its last write.
+    fn response(&self) -> service::ReadResponse {
+        service::ReadResponse {
+            mode: StreamMode::Sink.into(),
+            retention: prost_types::Duration::try_from(self.retention).ok(),
+            ..Default::default()
+        }
     }
 
     /// Resolves the chain a read from the beginning reads: the pinned one, or the run of the owner
@@ -247,53 +405,76 @@ impl RedisBackend {
         loop {
             if exists(&mut conn, &keys.meta).await? {
                 return self
-                    .read_after(conn, keys, req, "0-0".into(), deadline)
+                    .read_after(conn, keys, req, "0-0".into(), None, deadline)
                     .await;
             }
             if Instant::now() + CHAIN_POLL_INTERVAL > deadline {
-                return Ok(service::ReadResponse::default());
+                return Ok(self.response());
             }
             sleep(CHAIN_POLL_INTERVAL).await;
         }
     }
 
-    /// Reads what is there after `last_id`; if there is nothing, blocks for the rest of the wait.
-    /// Entries that the topic filter drops do not end the wait.
+    /// Reads what is there after `last_id`, up to `until` if set; if there is nothing, and no
+    /// `until`, blocks for the rest of the wait. Entries that the topic filter drops do not end the
+    /// wait. The read stops before the record that would take its payloads past `max_bytes`.
     async fn read_after(
         &self,
         mut conn: ConnectionManager,
         keys: &ChainKeys,
         req: &ReadRequest,
         mut last_id: String,
+        until: Option<String>,
         deadline: Instant,
     ) -> Result<service::ReadResponse> {
         let max_records = usize::try_from(req.max_records)
             .ok()
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_MAX_RECORDS);
+        let end = until.clone().unwrap_or_else(|| "+".into());
         let mut resp = service::ReadResponse {
             cursor: req.after.clone(),
-            ..Default::default()
+            ..self.response()
         };
-        loop {
+        let mut bytes = 0;
+        'read: loop {
             let reply: StreamRangeReply = conn
-                .xrange_count(&keys.log, format!("({last_id}"), "+", max_records)
+                .xrange_count(&keys.log, format!("({last_id}"), &end, max_records)
                 .await
                 .map_err(redis_error)?;
             let mut entries = reply.ids;
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if entries.is_empty() && !remaining.is_zero() {
+            if entries.is_empty() && !remaining.is_zero() && until.is_none() {
                 entries = self.block(&keys.log, &last_id, remaining).await?;
             }
             for entry in entries {
+                let r = record(keys.cursor(&entry.id), &entry.map, &req.topics)?;
+                if req.max_bytes > 0 {
+                    let n = r
+                        .as_ref()
+                        .and_then(|r| r.payload.as_ref())
+                        .map_or(0, |p| p.encoded_len() as i64);
+                    if bytes + n > req.max_bytes {
+                        if bytes == 0 {
+                            return Err(Error::stream(
+                                StreamFailureType::TooLarge,
+                                format!(
+                                    "the next record exceeds the read's limit of {} bytes",
+                                    req.max_bytes
+                                ),
+                            ));
+                        }
+                        break 'read;
+                    }
+                    bytes += n;
+                }
                 last_id = entry.id.clone();
                 resp.cursor = keys.cursor(&entry.id);
-                if let Some(r) = record(keys.cursor(&entry.id), &entry.map, &req.topics)? {
-                    resp.records.push(r);
-                }
+                resp.records.extend(r);
             }
             if !resp.records.is_empty()
                 || Instant::now() >= deadline
+                || until.is_some()
                 || self.closed_at(&mut conn, keys, &last_id).await?
             {
                 break;
@@ -344,7 +525,7 @@ impl RedisBackend {
         req: &ReadRequest,
     ) -> Result<service::ReadResponse> {
         let reply: StreamRangeReply = conn.xrevrange_all(&keys.log).await.map_err(redis_error)?;
-        let mut resp = service::ReadResponse::default();
+        let mut resp = self.response();
         if let Some(newest) = reply.ids.first() {
             resp.cursor = keys.cursor(&newest.id);
         }
@@ -609,6 +790,14 @@ fn digest(entries: &[Vec<(&str, Vec<u8>)>]) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+fn read_response(read: service::ReadResponse) -> WorkflowReadResponse {
+    WorkflowReadResponse {
+        digest: records_digest(&read.records),
+        read: Some(read),
+        ..Default::default()
+    }
 }
 
 fn stream_ref(stream: &Option<StreamRef>) -> Result<&StreamRef> {

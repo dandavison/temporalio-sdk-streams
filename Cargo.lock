@@ -1730,6 +1730,7 @@ dependencies = [
  "temporalio-protos",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

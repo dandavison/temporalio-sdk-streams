@@ -63,7 +63,10 @@ message Producer {
     }
 }
 
-// "Append". Appends the records as one atomic, contiguous batch.
+// "Append". Appends the records as one atomic, contiguous batch. On Redis, a stored append or close
+// is followed by a Notify of the stream's owner, coalesced per stream to at most one every 100 ms and
+// always one after the stream's last write. A failed Notify, after 30 s of retries, fails nothing:
+// it is logged, and the next write sends another.
 message AppendRequest {
     StreamRef stream = 1;
     Producer producer = 2;
@@ -144,7 +147,9 @@ message WorkflowReadResponse {
 // "WorkflowActivationCompleted". Sent by the worker after a successful activation, before the
 // activation's completion is sent. Appends the activation's records, splitting them into appends
 // that fit the size limits; in commit mode, returns them instead. If an append fails, the earlier
-// appends of the activation stay stored. Then writes close, if set.
+// appends of the activation stay stored. Then writes close, if set. On Redis, if it wrote anything,
+// it then sends one Notify of the owner, without retries; a failed Notify fails nothing and is
+// logged, and the run's next write sends another.
 message WorkflowActivationCompletedRequest {
     string workflow_id = 1;
     string run_id = 2;
