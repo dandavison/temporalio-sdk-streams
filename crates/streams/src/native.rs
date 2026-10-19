@@ -121,6 +121,7 @@ impl NativeBackend {
                 max_records: req.max_records,
                 wait: req.wait,
                 last: req.last,
+                ..Default::default()
             },
             options,
         )

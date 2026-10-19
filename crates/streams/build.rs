@@ -2,8 +2,8 @@
 //! generated types reuse sdk-core's. The stream service's protos are compiled first, on their own,
 //! and the crate's API protos refer to them as `crate::proto::service`.
 //!
-//! `protos/api` holds a copy of the stream service proto from the API repo. Nothing checks that
-//! the copy matches the API repo.
+//! `protos/api` holds a copy of the stream service proto from the API repo; the superproject's
+//! `check-stream-script` checks that it matches.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let core_descriptors = std::env::var("DEP_TEMPORALIO_PROTOS_DESCRIPTOR_PATH")?;
