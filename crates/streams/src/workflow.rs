@@ -140,11 +140,43 @@ mod tests {
             .collect()
     }
 
+    fn declared(messages: &[ProtocolMessage]) -> Vec<bool> {
+        messages
+            .iter()
+            .map(|m| {
+                m.body.as_ref().unwrap().type_url
+                    == "type.googleapis.com/temporal.api.nexusservices.streamservice.v1.StreamModeDeclaration"
+            })
+            .collect()
+    }
+
+    #[test]
+    fn commit_mode_declaration_comes_first_once_per_task_attempt() {
+        let mut run = run();
+        let first = commit_mode_messages(&mut run, records(1), true).unwrap();
+        assert_eq!(declared(&first), [true, false]);
+        let body = StreamModeDeclaration::decode(first[0].body.as_ref().unwrap().value.as_slice())
+            .unwrap();
+        assert_eq!(body.mode(), StreamMode::Commit);
+        assert_eq!(
+            declared(&commit_mode_messages(&mut run, vec![], true).unwrap()),
+            Vec::<bool>::new()
+        );
+        assert_eq!(
+            declared(&commit_mode_messages(&mut self::run(), vec![], true).unwrap()),
+            [true]
+        );
+        assert_eq!(
+            declared(&commit_mode_messages(&mut self::run(), records(1), false).unwrap()),
+            [false]
+        );
+    }
+
     #[test]
     fn commit_mode_messages_fit_size_limits_and_have_unique_ids() {
         let mut run = run();
-        let mut messages = commit_mode_messages(&mut run, records(2500)).unwrap();
-        messages.extend(commit_mode_messages(&mut run, records(1)).unwrap());
+        let mut messages = commit_mode_messages(&mut run, records(2500), false).unwrap();
+        messages.extend(commit_mode_messages(&mut run, records(1), false).unwrap());
         let sizes: Vec<usize> = messages
             .iter()
             .map(|m| {
