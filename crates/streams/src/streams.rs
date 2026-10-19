@@ -176,7 +176,7 @@ impl Streams {
         }
         let mut run = self.runs.for_task(stream, owner);
         if req.commit_mode {
-            let messages = commit_mode_messages(&mut run, req.records);
+            let messages = commit_mode_messages(&mut run, req.records, req.declare_mode);
             self.runs.put(run);
             return messages;
         }
