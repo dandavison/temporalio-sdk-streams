@@ -11,6 +11,7 @@ prost-types = "0.14"
 redis = { version = "0.32", features = ["tokio-comp", "script", "connection-manager"] }
 sha2 = "0.10"
 thiserror = "2"
+tracing = "0.1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 # sdk-core is used only for its client connection and its protos. sdk-python patches these to its
 # vendored sdk-core, so this rev is used only when the crate is built on its own.
@@ -21,4 +22,4 @@ temporalio-protos = { git = "https://github.com/dandavison/temporalio-sdk-core",
 prost-build = "0.14"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
