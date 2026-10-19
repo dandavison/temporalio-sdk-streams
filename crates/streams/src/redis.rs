@@ -139,14 +139,19 @@ impl RedisBackend {
         }
     }
 
-    /// Notifies the stream's owner after a workflow's own writes, once, without retries. A failure
-    /// is logged; the run's next write notifies again.
-    pub async fn workflow_appended(&self, stream: &StreamRef) {
-        if let Some(server) = &self.server
-            && let Err(e) = server.notify(stream, false).await
-        {
-            tracing::warn!(error = %e, ?stream, "Notify after a workflow's stream writes failed");
-        }
+    /// Notifies the stream's owner after a workflow's own writes, once, without retries, in the
+    /// background, so that the Notify adds nothing to the workflow task's latency. A failure is
+    /// logged; the run's next write notifies again.
+    pub fn workflow_appended(&self, stream: &StreamRef) {
+        let Some(server) = self.server.clone() else {
+            return;
+        };
+        let stream = stream.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server.notify(&stream, false).await {
+                tracing::warn!(error = %e, ?stream, "Notify after a workflow's stream writes failed");
+            }
+        });
     }
 
     /// Reads; if the read returns no records and no close and `notifier` is set, reads the owner's

@@ -133,9 +133,9 @@ impl Streams {
     }
 
     /// Notifies the owner of a Redis stream after a workflow's own writes.
-    async fn workflow_appended(&self, stream: &api::StreamRef) {
+    fn workflow_appended(&self, stream: &api::StreamRef) {
         if let Backend::Redis(b) = &self.backend {
-            b.workflow_appended(stream).await;
+            b.workflow_appended(stream);
         }
     }
 
@@ -219,7 +219,7 @@ impl Streams {
             wrote = true;
         }
         if wrote {
-            self.workflow_appended(&run.stream).await;
+            self.workflow_appended(&run.stream);
         }
         if let (Some(ending), Backend::Redis(_), false) = (req.ending, &self.backend, run.closed) {
             run.pending_close = close_for_ending(ending);
@@ -247,7 +247,7 @@ impl Streams {
             activity_owner: None,
         })
         .await?;
-        self.workflow_appended(&run.stream).await;
+        self.workflow_appended(&run.stream);
         Ok(())
     }
 }
