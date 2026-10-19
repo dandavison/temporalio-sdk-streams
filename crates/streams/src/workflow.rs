@@ -11,8 +11,10 @@ use std::sync::Mutex;
 use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 /// What the worker knows of a run's appends: its current workflow task attempt, the next seq in
-/// that attempt, and a close to write once the server has accepted the run's terminal completion.
-/// Keyed by run ID; an entry is removed when the run is evicted.
+/// that attempt, whether the workflow closed its stream, and a close to write once the server has
+/// accepted the run's terminal completion. Keyed by run ID; an entry is removed when the run is
+/// evicted, so a close by an evicted run is forgotten, and the worker then writes the ending's close
+/// too, which fails as CLOSED and is logged.
 #[derive(Default)]
 pub struct Runs(Mutex<HashMap<String, Run>>);
 
@@ -20,6 +22,7 @@ pub struct Run {
     pub stream: StreamRef,
     pub owner: WorkflowProducer,
     pub next_seq: i64,
+    pub closed: bool,
     pub pending_close: Option<StreamClose>,
 }
 
@@ -30,10 +33,18 @@ impl Runs {
         let mut runs = self.0.lock().unwrap();
         match runs.remove(&owner.run_id) {
             Some(run) if run.owner == owner => run,
-            _ => Run {
+            Some(run) => Run {
                 stream,
                 owner,
                 next_seq: 0,
+                closed: run.closed,
+                pending_close: None,
+            },
+            None => Run {
+                stream,
+                owner,
+                next_seq: 0,
+                closed: false,
                 pending_close: None,
             },
         }
@@ -112,6 +123,7 @@ mod tests {
                 attempt: 1,
             },
             next_seq: 0,
+            closed: false,
             pending_close: None,
         }
     }

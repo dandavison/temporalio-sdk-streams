@@ -94,13 +94,14 @@ impl Streams {
     }
 
     /// Appends an activation's records, in appends that fit the size limits, or in commit mode
-    /// returns them as protocol messages for the activation's completion. If the completion ends
-    /// the run, a Redis stream's close is kept until the eviction that says the server accepted it;
-    /// a native stream is closed by the server.
+    /// returns them as protocol messages for the activation's completion, and then writes the
+    /// workflow's own close if it closed its stream. Otherwise, if the completion ends the run, a
+    /// Redis stream's close is kept until the eviction that says the server accepted it; a native
+    /// stream is closed by the server.
     ///
-    /// If one of the appends fails, the earlier ones stay stored and the call fails, which fails
-    /// the activation; the workflow task's next attempt appends the records again under its own
-    /// epoch.
+    /// If one of the appends or the close fails, the earlier appends stay stored and the call
+    /// fails, which fails the activation; the workflow task's next attempt appends the records
+    /// again under its own epoch.
     async fn workflow_activation_completed(
         &self,
         req: WorkflowActivationCompletedRequest,
@@ -115,10 +116,20 @@ impl Streams {
             previous_started_event_id: req.previous_started_event_id,
             attempt: req.attempt,
         };
+        if req.commit_mode {
+            if !matches!(self.backend, Backend::Native(_)) {
+                return Err(Error::InvalidArgument(
+                    "commit mode needs the native backend".into(),
+                ));
+            }
+            if req.close.is_some() {
+                return Err(Error::InvalidArgument(
+                    "a workflow in commit mode cannot close its own stream".into(),
+                ));
+            }
+        }
         let mut run = self.runs.for_task(stream, owner);
-        if let Backend::Native(native) = &self.backend
-            && native.commit_mode()
-        {
+        if req.commit_mode {
             let messages = commit_mode_messages(&mut run, req.records);
             self.runs.put(run);
             return messages;
@@ -141,7 +152,24 @@ impl Streams {
             }
             run.next_seq += 1;
         }
-        if let (Some(ending), Backend::Redis(_)) = (req.ending, &self.backend) {
+        if let Some(close) = req.close {
+            let closed = self
+                .close(api::CloseRequest {
+                    stream: Some(run.stream.clone()),
+                    owner: Some(run.owner.clone()),
+                    seq: run.next_seq,
+                    close: Some(close),
+                    activity_owner: None,
+                })
+                .await;
+            if let Err(e) = closed {
+                self.runs.put(run);
+                return Err(e);
+            }
+            run.next_seq += 1;
+            run.closed = true;
+        }
+        if let (Some(ending), Backend::Redis(_), false) = (req.ending, &self.backend, run.closed) {
             run.pending_close = close_for_ending(ending);
         }
         self.runs.put(run);

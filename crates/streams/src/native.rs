@@ -17,8 +17,12 @@ use crate::proto::{Failure, Payload};
 use crate::retry::with_retries;
 use prost::{Message, Name};
 use std::collections::HashMap;
+use std::time::Duration;
 use temporalio_client::Connection;
 use temporalio_client::grpc::WorkflowService;
+use temporalio_client::tonic::metadata::{
+    AsciiMetadataKey, AsciiMetadataValue, MetadataKey, MetadataValue,
+};
 use temporalio_client::tonic::{self, Code};
 use temporalio_protos::temporal::api::workflowservice::v1::{
     StartNexusOperationRequest, start_nexus_operation_response,
@@ -30,7 +34,13 @@ const SERVICE: &str = "temporal.api.nexusservices.streamservice.v1.StreamService
 pub struct NativeBackend {
     connection: Connection,
     namespace: String,
-    commit_mode: bool,
+}
+
+/// gRPC metadata and deadline for each call of an operation.
+#[derive(Default)]
+struct CallOptions {
+    metadata: HashMap<String, Vec<u8>>,
+    timeout: Option<Duration>,
 }
 
 impl NativeBackend {
@@ -38,13 +48,7 @@ impl NativeBackend {
         Self {
             connection,
             namespace: options.namespace,
-            commit_mode: options.commit_mode,
         }
-    }
-
-    /// Whether workflows' own records travel in the workflow task completion.
-    pub fn commit_mode(&self) -> bool {
-        self.commit_mode
     }
 
     pub async fn append(&self, req: AppendRequest) -> Result<Vec<Vec<u8>>> {
@@ -59,6 +63,7 @@ impl NativeBackend {
                     records: req.records,
                     finish: req.finish,
                 },
+                CallOptions::default(),
             )
             .await?;
         Ok(resp.cursors)
@@ -92,12 +97,21 @@ impl NativeBackend {
                     close: req.close,
                     activity_task_token,
                 },
+                CallOptions::default(),
             )
             .await?;
         Ok(())
     }
 
     pub async fn read(&self, req: ReadRequest) -> Result<service::ReadResponse> {
+        let options = CallOptions {
+            metadata: req.rpc_metadata,
+            timeout: req
+                .rpc_timeout
+                .map(Duration::try_from)
+                .transpose()
+                .map_err(|e| Error::InvalidArgument(e.to_string()))?,
+        };
         self.call(
             "Read",
             &service::ReadRequest {
@@ -108,6 +122,7 @@ impl NativeBackend {
                 wait: req.wait,
                 last: req.last,
             },
+            options,
         )
         .await
     }
@@ -119,6 +134,7 @@ impl NativeBackend {
         &self,
         operation: &str,
         req: &Req,
+        options: CallOptions,
     ) -> Result<Resp> {
         let request = StartNexusOperationRequest {
             namespace: self.namespace.clone(),
@@ -137,15 +153,12 @@ impl NativeBackend {
         };
         let response = with_retries(|| {
             let mut connection = self.connection.clone();
-            let request = request.clone();
+            let request = grpc_request(request.clone(), &options);
             async move {
-                WorkflowService::start_nexus_operation(
-                    &mut connection,
-                    tonic::Request::new(request),
-                )
-                .await
-                .map(tonic::Response::into_inner)
-                .map_err(status_error)
+                WorkflowService::start_nexus_operation(&mut connection, request?)
+                    .await
+                    .map(tonic::Response::into_inner)
+                    .map_err(status_error)
             }
         })
         .await?;
@@ -161,6 +174,29 @@ impl NativeBackend {
             ))),
         }
     }
+}
+
+fn grpc_request<T>(message: T, options: &CallOptions) -> Result<tonic::Request<T>> {
+    let mut request = tonic::Request::new(message);
+    for (key, value) in &options.metadata {
+        let invalid = |e: &dyn std::fmt::Display| {
+            Error::InvalidArgument(format!("invalid RPC metadata {key}: {e}"))
+        };
+        if key.ends_with("-bin") {
+            let key = MetadataKey::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?;
+            request
+                .metadata_mut()
+                .insert_bin(key, MetadataValue::from_bytes(value));
+        } else {
+            let key = AsciiMetadataKey::from_bytes(key.as_bytes()).map_err(|e| invalid(&e))?;
+            let value = AsciiMetadataValue::try_from(value.as_slice()).map_err(|e| invalid(&e))?;
+            request.metadata_mut().insert(key, value);
+        }
+    }
+    if let Some(timeout) = options.timeout {
+        request.set_timeout(timeout);
+    }
+    Ok(request)
 }
 
 fn service_ref(stream: Option<api::StreamRef>) -> Option<service::StreamRef> {
