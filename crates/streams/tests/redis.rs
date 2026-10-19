@@ -225,6 +225,7 @@ async fn activation_completed(
             attempt: owner.attempt,
             records: records(values),
             ending,
+            ..Default::default()
         },
     )
     .await?;
@@ -677,4 +678,78 @@ async fn only_the_owning_activity_closes_its_stream() {
         .await
         .unwrap();
     assert_eq!(resp.close.unwrap().state(), CloseState::Completed);
+}
+
+#[tokio::test]
+async fn commit_mode_activation_is_refused() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let result: Result<WorkflowActivationCompletedResponse, Error> = call(
+        &s,
+        "WorkflowActivationCompleted",
+        WorkflowActivationCompletedRequest {
+            workflow_id: "wf".into(),
+            run_id: "run-1".into(),
+            first_run_id: "run-1".into(),
+            previous_started_event_id: 3,
+            attempt: 1,
+            records: records(&["a"]),
+            commit_mode: true,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn workflow_close_follows_the_activation_records_and_replaces_the_ending_close() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let _: WorkflowActivationCompletedResponse = call(
+        &s,
+        "WorkflowActivationCompleted",
+        WorkflowActivationCompletedRequest {
+            workflow_id: "wf".into(),
+            run_id: "run-1".into(),
+            first_run_id: "run-1".into(),
+            previous_started_event_id: 3,
+            attempt: 1,
+            records: records(&["a"]),
+            close: Some(StreamClose {
+                state: CloseState::Failed.into(),
+                reason: "done".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let resp = read(&s, stream("run-1"), vec![]).await.unwrap();
+    assert_eq!(values(&resp), ["a"]);
+    let close = resp.close.unwrap();
+    assert_eq!(
+        (close.state(), close.reason.as_str()),
+        (CloseState::Failed, "done")
+    );
+
+    activation_completed(
+        &s,
+        owner(9, 1),
+        &[],
+        ending(CloseState::Completed, false, false),
+    )
+    .await
+    .unwrap();
+    evicted(&s, true).await;
+    let close = read(&s, stream("run-1"), vec![])
+        .await
+        .unwrap()
+        .close
+        .unwrap();
+    assert_eq!(close.state(), CloseState::Failed);
 }
