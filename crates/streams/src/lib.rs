@@ -11,6 +11,7 @@ mod native;
 pub mod proto;
 mod redis;
 mod retry;
+mod stream_ref;
 mod streams;
 mod workflow;
 

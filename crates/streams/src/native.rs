@@ -1,5 +1,6 @@
-//! A backend that stores streams in Temporal, embedded in their owner: a workflow run, or a
-//! Standalone Activity execution. Every operation is a direct Nexus call to the stream service on
+//! A backend that stores streams in Temporal, embedded in their owner, a workflow run or a
+//! Standalone Activity execution, under their names; or, for a standalone stream, in an execution of
+//! its own. Every operation is a direct Nexus call to the stream service on
 //! the System Nexus Endpoint, which the server runs in a transaction on the owner, so the server
 //! needs CHASM and direct Nexus calls enabled. The server checks the owner's own activity and
 //! workflow task producers, records which attempt completed each of an owning workflow's tasks,
@@ -11,7 +12,9 @@
 
 use crate::error::{Error, Result};
 use crate::limits;
-use crate::proto::api::{self, AppendRequest, CloseRequest, ReadRequest, producer::Variant};
+use crate::proto::api::{
+    self, AppendRequest, CloseRequest, CreateRequest, ReadRequest, producer::Variant,
+};
 use crate::proto::service::{self, StreamFailureType};
 use crate::proto::{Failure, Payload};
 use crate::retry::with_retries;
@@ -51,6 +54,21 @@ impl NativeBackend {
         }
     }
 
+    pub async fn create(&self, req: CreateRequest) -> Result<bool> {
+        let resp: service::CreateResponse = self
+            .call(
+                "Create",
+                &service::CreateRequest {
+                    stream: service_ref(req.stream),
+                    request_id: req.request_id,
+                    settings: req.settings,
+                },
+                CallOptions::default(),
+            )
+            .await?;
+        Ok(resp.created)
+    }
+
     pub async fn append(&self, req: AppendRequest) -> Result<Vec<Vec<u8>>> {
         limits::check(&req.records)?;
         let resp: service::AppendResponse = self
@@ -80,6 +98,9 @@ impl NativeBackend {
                 vec![],
             ),
             (None, Some(a)) => (None, a.task_token),
+            (None, None) if req.stream.as_ref().is_some_and(|s| !s.stream_id.is_empty()) => {
+                (None, vec![])
+            }
             _ => {
                 return Err(Error::stream(
                     StreamFailureType::NotOwner,
@@ -206,6 +227,8 @@ fn service_ref(stream: Option<api::StreamRef>) -> Option<service::StreamRef> {
         activity_id: s.activity_id,
         activity_run_id: s.activity_run_id,
         namespace: String::new(),
+        name: s.name,
+        stream_id: s.stream_id,
     })
 }
 

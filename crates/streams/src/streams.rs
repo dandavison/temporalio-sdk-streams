@@ -4,11 +4,11 @@ use crate::native::NativeBackend;
 use crate::proto::api::{
     self, AppendResponse, CloseResponse, Producer, WorkflowActivationCompletedRequest,
     WorkflowActivationCompletedResponse, WorkflowEvictedRequest, WorkflowEvictedResponse,
-    WorkflowProducer, producer::Variant,
+    WorkflowProducer, WorkflowStreamWrites, producer::Variant,
 };
 use crate::proto::service;
 use crate::redis::RedisBackend;
-use crate::workflow::{Runs, close_for_ending, commit_mode_messages};
+use crate::workflow::{Run, Runs, close_for_ending, commit_mode_messages};
 use prost::Message;
 use temporalio_client::Connection;
 use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
@@ -43,6 +43,10 @@ impl Streams {
     /// their messages are in `protos/temporal/sdk/streams/v1/streams.proto`.
     pub async fn call(&self, name: &str, request: &[u8]) -> Result<Vec<u8>> {
         Ok(match name {
+            "Create" => service::CreateResponse {
+                created: self.create(api::CreateRequest::decode(request)?).await?,
+            }
+            .encode_to_vec(),
             "Append" => AppendResponse {
                 cursors: self.append(api::AppendRequest::decode(request)?).await?,
             }
@@ -72,6 +76,13 @@ impl Streams {
         })
     }
 
+    async fn create(&self, req: api::CreateRequest) -> Result<bool> {
+        match &self.backend {
+            Backend::Native(b) => b.create(req).await,
+            Backend::Redis(b) => b.create(req).await,
+        }
+    }
+
     async fn append(&self, req: api::AppendRequest) -> Result<Vec<Vec<u8>>> {
         match &self.backend {
             Backend::Native(b) => b.append(req).await,
@@ -93,15 +104,15 @@ impl Streams {
         }
     }
 
-    /// Appends an activation's records, in appends that fit the size limits, or in commit mode
-    /// returns them as protocol messages for the activation's completion, and then writes the
-    /// workflow's own close if it closed its stream. Otherwise, if the completion ends the run, a
-    /// Redis stream's close is kept until the eviction that says the server accepted it; a native
-    /// stream is closed by the server.
+    /// Appends an activation's records to each of the workflow's streams that it wrote to, in
+    /// appends that fit the size limits, or in commit mode returns them as protocol messages for the
+    /// activation's completion, and then writes each stream's close that the workflow made.
+    /// Otherwise, if the completion ends the run, a Redis run's close is kept until the eviction
+    /// that says the server accepted it; native streams are closed by the server.
     ///
-    /// If one of the appends or the close fails, the earlier appends stay stored and the call
-    /// fails, which fails the activation; the workflow task's next attempt appends the records
-    /// again under its own epoch.
+    /// If one of the appends or closes fails, the earlier ones stay stored and the call fails, which
+    /// fails the activation; the workflow task's next attempt appends the records again under its
+    /// own epoch.
     async fn workflow_activation_completed(
         &self,
         req: WorkflowActivationCompletedRequest,
@@ -122,78 +133,84 @@ impl Streams {
                     "commit mode needs the native backend".into(),
                 ));
             }
-            if req.close.is_some() {
+            if req.streams.iter().any(|w| w.close.is_some()) {
                 return Err(Error::InvalidArgument(
-                    "a workflow in commit mode cannot close its own stream".into(),
+                    "a workflow in commit mode cannot close its own streams".into(),
                 ));
             }
         }
         let mut run = self.runs.for_task(stream, owner);
         if req.commit_mode {
-            let messages = commit_mode_messages(&mut run, req.records);
+            let mut messages = vec![];
+            for writes in req.streams {
+                match commit_mode_messages(&mut run, &writes.name, writes.records) {
+                    Ok(m) => messages.extend(m),
+                    Err(e) => {
+                        self.runs.put(run);
+                        return Err(e);
+                    }
+                }
+            }
             self.runs.put(run);
-            return messages;
+            return Ok(messages);
         }
-        for records in limits::split(req.records)? {
-            let appended = self
-                .append(api::AppendRequest {
-                    stream: Some(run.stream.clone()),
-                    producer: Some(Producer {
-                        variant: Some(Variant::Workflow(run.owner.clone())),
-                    }),
-                    seq: run.next_seq,
-                    records,
-                    finish: false,
-                })
-                .await;
-            if let Err(e) = appended {
+        for writes in req.streams {
+            if let Err(e) = self.write_stream(&mut run, writes).await {
                 self.runs.put(run);
                 return Err(e);
             }
-            run.next_seq += 1;
         }
-        if let Some(close) = req.close {
-            let closed = self
-                .close(api::CloseRequest {
-                    stream: Some(run.stream.clone()),
-                    owner: Some(run.owner.clone()),
-                    seq: run.next_seq,
-                    close: Some(close),
-                    activity_owner: None,
-                })
-                .await;
-            if let Err(e) = closed {
-                self.runs.put(run);
-                return Err(e);
-            }
-            run.next_seq += 1;
-            run.closed = true;
-        }
-        if let (Some(ending), Backend::Redis(_), false) = (req.ending, &self.backend, run.closed) {
+        if let (Some(ending), Backend::Redis(_)) = (req.ending, &self.backend) {
             run.pending_close = close_for_ending(ending);
         }
         self.runs.put(run);
         Ok(vec![])
     }
 
+    /// Appends one stream's records, as the run's workflow task, and then its close, if any.
+    async fn write_stream(&self, run: &mut Run, writes: WorkflowStreamWrites) -> Result<()> {
+        let stream = run.stream(&writes.name);
+        for records in limits::split(writes.records)? {
+            let seq = run.next_seq.get(&writes.name).copied().unwrap_or(0);
+            self.append(api::AppendRequest {
+                stream: Some(stream.clone()),
+                producer: Some(Producer {
+                    variant: Some(Variant::Workflow(run.owner.clone())),
+                }),
+                seq,
+                records,
+                finish: false,
+            })
+            .await?;
+            run.next_seq.insert(writes.name.clone(), seq + 1);
+        }
+        if let Some(close) = writes.close {
+            let seq = run.next_seq.get(&writes.name).copied().unwrap_or(0);
+            self.close(api::CloseRequest {
+                stream: Some(stream),
+                owner: Some(run.owner.clone()),
+                seq,
+                close: Some(close),
+                activity_owner: None,
+            })
+            .await?;
+            run.next_seq.insert(writes.name, seq + 1);
+        }
+        Ok(())
+    }
+
     /// Forgets an evicted run, first writing its pending close if the eviction says the server
-    /// accepted the run's terminal completion. The run is forgotten before the close is written, so
-    /// a close that fails after the retries is not written later, and the stream stays open until
-    /// its retention passes.
+    /// accepted the run's terminal completion: on Redis, every stream of the run that is open is
+    /// closed, and later appends to the run's streams that do not exist yet fail as closed. The run
+    /// is forgotten before the close is written, so a close that fails after the retries is not
+    /// written later, and the streams stay open until their retention passes.
     async fn workflow_evicted(&self, req: WorkflowEvictedRequest) -> Result<()> {
         let Some(run) = self.runs.remove(&req.run_id) else {
             return Ok(());
         };
-        let (true, Some(close)) = (req.execution_ending, run.pending_close) else {
-            return Ok(());
-        };
-        self.close(api::CloseRequest {
-            stream: Some(run.stream),
-            owner: Some(run.owner),
-            seq: run.next_seq,
-            close: Some(close),
-            activity_owner: None,
-        })
-        .await
+        match (req.execution_ending, run.pending_close, &self.backend) {
+            (true, Some(close), Backend::Redis(b)) => b.end_owner(&run.stream, close).await,
+            _ => Ok(()),
+        }
     }
 }

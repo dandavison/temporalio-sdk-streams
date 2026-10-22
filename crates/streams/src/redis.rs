@@ -1,15 +1,16 @@
 //! A backend that stores streams in Redis, as a worker or client does. The server never talks to
 //! Redis.
 //!
-//! A stream is keyed by its owner: a workflow run chain, by workflow ID and first run ID, or a
-//! Standalone Activity execution, by activity ID and run ID. The owner's kind is part of the key,
-//! so a workflow and an activity with the same ID have different streams. A stream is four keys
-//! sharing a hash tag with the owner's kind and ID: a Redis stream holding the log, a hash holding
-//! each producer's dedupe and fencing state, a metadata hash holding existence and close, and a
-//! tombstone. A fifth key, with the same hash tag, holds the run of the owner ID that most recently
-//! created a stream, for readers that do not know the run ID. Every append and close goes through
-//! one Lua script, which checks and writes in one step; producers that write to the Redis stream
-//! directly are not supported.
+//! A stream is keyed by its owner and name: a workflow run chain, by workflow ID and first run ID,
+//! or a Standalone Activity execution, by activity ID and run ID; or, for a standalone stream, by
+//! its stream ID alone. The owner's kind is part of the key, so a workflow, an activity and a
+//! standalone stream with the same ID have different streams. A stream is four keys sharing a hash
+//! tag with the owner's kind and ID: a Redis stream holding the log, a hash holding each producer's
+//! dedupe and fencing state, a metadata hash holding existence, settings and close, and a tombstone.
+//! An owner run also has a set of its streams' names and a key set when it ends, and an owner a key
+//! holding the run of the owner ID whose first stream was created most recently, for readers that
+//! do not know the run ID. Every create, append and close goes through one Lua script, which checks
+//! and writes in one step; producers that write to the Redis stream directly are not supported.
 //!
 //! Every write refreshes the keys' time-to-live, the retention, so a stream that is no longer
 //! written to is removed, closed or not; reads do not refresh it. Producer state is removed only
@@ -24,16 +25,22 @@
 //!   tell that a task is speculative.
 //! - Producers are not verified, and anything that can write to Redis can write any key, so the
 //!   owner-only close guards against mistakes, not against other writers.
-//! - The owner's worker writes the close. A stream is left open, until its retention passes, when
-//!   its workflow is terminated or times out, when a failed run with a retry policy is not
-//!   retried (native closes it, because the server knows its retries are exhausted), or when the
-//!   worker stops before writing the close. Until then producers can keep
+//! - The owner's worker writes the close, of every stream of the run. A stream is left open, until
+//!   its retention passes, when its workflow is terminated or times out, when a failed run with a
+//!   retry policy is not retried (native closes it, because the server knows its retries are
+//!   exhausted), or when the worker stops before writing the close. Until then producers can keep
 //!   appending.
 //! - Nothing closes a Standalone Activity's stream when the activity ends; the activity must close
 //!   it itself. The worker cannot learn whether the server accepted the activity's completion,
 //!   because Core discards the result of the Respond call, or whether a failed attempt will be
 //!   retried, which only the server knows.
 //! - A topic filter is applied after reading: the reader receives every record.
+//! - A standalone stream's idle timeout is applied by the next create, append or close after it,
+//!   and by readers before they report whether the stream is closed, because nothing in Redis runs
+//!   when it passes. So a reader waiting at the stream's end learns of the close only when its wait
+//!   ends.
+//! - Any caller may close a standalone stream, on every backend; the creator's right to close is not
+//!   enforced.
 //! - Redis can acknowledge a write that it then loses: on a restart, unless the append-only file is
 //!   fsynced on every write, or on a failover to a replica that had not received it. The deployment
 //!   check does not check persistence.
@@ -45,11 +52,13 @@ use crate::error::{Error, Result};
 use crate::identity::{Identity, identity};
 use crate::limits;
 use crate::proto::api::{
-    AppendRequest, CloseRequest, Producer, ReadRequest, RedisOptions, StreamRef, producer::Variant,
+    AppendRequest, CloseRequest, CreateRequest, Producer, ReadRequest, RedisOptions, StreamRef,
+    producer::Variant,
 };
 use crate::proto::service::{self, ProducerIdentity, Record, StreamClose, StreamFailureType};
 use crate::proto::{Failure, Payload};
 use crate::retry::with_retries;
+use crate::stream_ref::{self, idle_timeout};
 use prost::Message;
 use redis::aio::{ConnectionManager, MultiplexedConnection};
 use redis::streams::{StreamRangeReply, StreamReadOptions, StreamReadReply};
@@ -91,7 +100,7 @@ impl RedisBackend {
             conn,
             namespace: options.namespace,
             retention,
-            script: Script::new(include_str!("append.lua")),
+            script: Script::new(include_str!("stream.lua")),
         })
     }
 
@@ -116,7 +125,7 @@ impl RedisBackend {
         if req.finish {
             entries.push(vec![("kind", b"finish".to_vec())]);
         }
-        let keys = self.chain_keys(&owner_key(stream), required_run(stream)?);
+        let keys = self.write_keys(stream)?;
         let ids = self
             .run_append(&keys, &id, req.seq, &entries, false)
             .await?;
@@ -127,8 +136,37 @@ impl RedisBackend {
             .collect())
     }
 
+    /// Creates the stream, or answers a create of the stream if it exists. Returns whether this
+    /// create, by its request ID, created it.
+    pub async fn create(&self, req: CreateRequest) -> Result<bool> {
+        let stream = stream_ref(&req.stream)?;
+        let idle = idle_timeout(stream, req.settings.as_ref())?;
+        let keys = self.write_keys(stream)?;
+        let mut invocation = self.script.prepare_invoke();
+        self.stream_invocation(&mut invocation, &keys, "create", idle);
+        invocation.arg(&req.request_id);
+        let created: i64 = self.invoke(&invocation).await?;
+        Ok(created == 1)
+    }
+
     pub async fn close(&self, req: CloseRequest) -> Result<()> {
         let stream = stream_ref(&req.stream)?;
+        let close = req.close.clone().unwrap_or_default();
+        let failure = close.failure.map(|f| f.encode_to_vec()).unwrap_or_default();
+        if !stream.stream_id.is_empty() {
+            let keys = self.write_keys(stream)?;
+            let mut invocation = self.script.prepare_invoke();
+            invocation
+                .key(&keys.meta)
+                .key(&keys.tombstone)
+                .arg("close")
+                .arg(self.retention_ms())
+                .arg(close.state)
+                .arg(failure)
+                .arg(&close.reason);
+            let _: Value = self.invoke(&invocation).await?;
+            return Ok(());
+        }
         let owner = match (req.owner, req.activity_owner) {
             (Some(w), None) if stream.activity_id.is_empty() => Variant::Workflow(w),
             (None, Some(a))
@@ -145,21 +183,36 @@ impl RedisBackend {
                 ));
             }
         };
-        let close = req.close.unwrap_or_default();
         let id = identity(&Producer {
             variant: Some(owner),
         })?;
         let entry = vec![
             ("kind", b"close".to_vec()),
             ("state", close.state.to_string().into_bytes()),
-            (
-                "failure",
-                close.failure.map(|f| f.encode_to_vec()).unwrap_or_default(),
-            ),
+            ("failure", failure),
             ("reason", close.reason.into_bytes()),
         ];
-        let keys = self.chain_keys(&owner_key(stream), required_run(stream)?);
+        let keys = self.write_keys(stream)?;
         self.run_append(&keys, &id, req.seq, &[entry], true).await?;
+        Ok(())
+    }
+
+    /// Closes every stream of a workflow run that is not closed, and makes later creates and appends
+    /// of the run's streams that do not exist yet fail as closed. Called once the server has
+    /// accepted the run's terminal completion.
+    pub async fn end_owner(&self, stream: &StreamRef, close: StreamClose) -> Result<()> {
+        let keys = self.write_keys(stream)?;
+        let mut invocation = self.script.prepare_invoke();
+        invocation
+            .key(&keys.ended)
+            .key(&keys.streams)
+            .arg("end_owner")
+            .arg(&keys.run_prefix)
+            .arg(self.retention_ms())
+            .arg(close.state)
+            .arg(close.failure.map(|f| f.encode_to_vec()).unwrap_or_default())
+            .arg(&close.reason);
+        let _: i64 = self.invoke(&invocation).await?;
         Ok(())
     }
 
@@ -177,7 +230,7 @@ impl RedisBackend {
                 None => return Ok(service::ReadResponse::default()),
             }
         } else {
-            let (first_run, entry_id) = self.parse_cursor(&owner_key(stream), &req.after)?;
+            let (first_run, entry_id) = self.parse_cursor(stream, &req.after)?;
             let run = owner_run(stream);
             if !run.is_empty() && run != first_run {
                 return Err(Error::stream(
@@ -185,7 +238,7 @@ impl RedisBackend {
                     "the cursor belongs to another run chain",
                 ));
             }
-            (self.chain_keys(&owner_key(stream), &first_run), entry_id)
+            (self.keys(stream, &first_run), entry_id)
         };
         if !exists(&mut conn, &keys.meta).await? {
             if exists(&mut conn, &keys.tombstone).await? {
@@ -204,10 +257,13 @@ impl RedisBackend {
                 .wait_for_chain_records(conn, &keys, &req, deadline)
                 .await;
         }
-        if req.last > 0 {
-            return self.read_last(&mut conn, &keys, &req).await;
-        }
-        self.read_after(conn, &keys, &req, after, deadline).await
+        let mut resp = if req.last > 0 {
+            self.read_last(&mut conn, &keys, &req).await?
+        } else {
+            self.read_after(conn, &keys, &req, after, deadline).await?
+        };
+        resp.exists = true;
+        Ok(resp)
     }
 
     /// Resolves the chain a read from the beginning reads: the pinned one, or the run of the owner
@@ -218,16 +274,15 @@ impl RedisBackend {
         conn: &mut ConnectionManager,
         stream: &StreamRef,
         deadline: Instant,
-    ) -> Result<Option<ChainKeys>> {
-        let owner = owner_key(stream);
-        if !owner_run(stream).is_empty() {
-            return Ok(Some(self.chain_keys(&owner, owner_run(stream))));
+    ) -> Result<Option<StreamKeys>> {
+        if !owner_run(stream).is_empty() || !stream.stream_id.is_empty() {
+            return Ok(Some(self.keys(stream, owner_run(stream))));
         }
-        let current = self.current_key(&owner);
+        let current = self.current_key(&owner_key(stream));
         loop {
             let first_run: Option<String> = conn.get(&current).await.map_err(redis_error)?;
             if let Some(first_run) = first_run {
-                return Ok(Some(self.chain_keys(&owner, &first_run)));
+                return Ok(Some(self.keys(stream, &first_run)));
             }
             if Instant::now() + CHAIN_POLL_INTERVAL > deadline {
                 return Ok(None);
@@ -240,7 +295,7 @@ impl RedisBackend {
     async fn wait_for_chain_records(
         &self,
         mut conn: ConnectionManager,
-        keys: &ChainKeys,
+        keys: &StreamKeys,
         req: &ReadRequest,
         deadline: Instant,
     ) -> Result<service::ReadResponse> {
@@ -262,7 +317,7 @@ impl RedisBackend {
     async fn read_after(
         &self,
         mut conn: ConnectionManager,
-        keys: &ChainKeys,
+        keys: &StreamKeys,
         req: &ReadRequest,
         mut last_id: String,
         deadline: Instant,
@@ -340,7 +395,7 @@ impl RedisBackend {
     async fn read_last(
         &self,
         conn: &mut ConnectionManager,
-        keys: &ChainKeys,
+        keys: &StreamKeys,
         req: &ReadRequest,
     ) -> Result<service::ReadResponse> {
         let reply: StreamRangeReply = conn.xrevrange_all(&keys.log).await.map_err(redis_error)?;
@@ -357,8 +412,7 @@ impl RedisBackend {
                 resp.records.insert(0, r);
             }
         }
-        let closed: Option<String> = conn.hget(&keys.meta, "closed").await.map_err(redis_error)?;
-        if closed.as_deref() == Some("1") {
+        if self.closed(conn, keys).await? {
             resp.close = Some(close_from_meta(conn, keys).await?);
         }
         Ok(resp)
@@ -369,11 +423,10 @@ impl RedisBackend {
     async fn closed_at(
         &self,
         conn: &mut ConnectionManager,
-        keys: &ChainKeys,
+        keys: &StreamKeys,
         last_id: &str,
     ) -> Result<bool> {
-        let closed: Option<String> = conn.hget(&keys.meta, "closed").await.map_err(redis_error)?;
-        if closed.as_deref() != Some("1") {
+        if !self.closed(conn, keys).await? {
             return Ok(false);
         }
         let after: StreamRangeReply = conn
@@ -383,63 +436,125 @@ impl RedisBackend {
         Ok(after.ids.is_empty())
     }
 
-    /// Runs the append script, retrying transient failures. A retry after the script ran but its
-    /// reply was lost takes the dedupe path and returns the stored entry IDs.
+    /// Runs the append script. A retry after the script ran but its reply was lost takes the dedupe
+    /// path and returns the stored entry IDs.
     async fn run_append(
         &self,
-        keys: &ChainKeys,
+        keys: &StreamKeys,
         id: &Identity,
         seq: i64,
         entries: &[Vec<(&str, Vec<u8>)>],
         closing: bool,
     ) -> Result<Vec<String>> {
-        let retention_ms = u64::try_from(self.retention.as_millis()).unwrap_or(u64::MAX);
-        with_retries(|| {
-            let mut invocation = self.script.prepare_invoke();
-            invocation
-                .key(&keys.meta)
-                .key(&keys.log)
-                .key(&keys.producers)
-                .key(&keys.tombstone)
-                .key(&keys.current)
-                .arg(&keys.first_run)
-                .arg(&id.producer)
-                .arg(&id.run_id)
-                .arg(id.workflow_task)
-                .arg(id.workflow_task_attempt)
-                .arg(id.epoch)
-                .arg(seq)
-                .arg(digest(entries))
-                .arg(if closing { "1" } else { "0" })
-                .arg(retention_ms)
-                .arg(entries.len());
-            for entry in entries {
-                invocation.arg(entry.len());
-                for (field, value) in entry {
-                    invocation.arg(*field).arg(value.as_slice());
-                }
+        let idle = if keys.standalone {
+            stream_ref::DEFAULT_IDLE_TIMEOUT
+        } else {
+            Duration::ZERO
+        };
+        let mut invocation = self.script.prepare_invoke();
+        self.stream_invocation(&mut invocation, keys, "append", idle);
+        invocation
+            .arg(&id.producer)
+            .arg(&id.run_id)
+            .arg(id.workflow_task)
+            .arg(id.workflow_task_attempt)
+            .arg(id.epoch)
+            .arg(seq)
+            .arg(digest(entries))
+            .arg(if closing { "1" } else { "0" })
+            .arg(entries.len());
+        for entry in entries {
+            invocation.arg(entry.len());
+            for (field, value) in entry {
+                invocation.arg(*field).arg(value.as_slice());
             }
+        }
+        self.invoke(&invocation).await
+    }
+
+    /// Adds the keys and leading arguments of a create or append.
+    fn stream_invocation(
+        &self,
+        invocation: &mut redis::ScriptInvocation<'_>,
+        keys: &StreamKeys,
+        op: &str,
+        idle: Duration,
+    ) {
+        invocation
+            .key(&keys.meta)
+            .key(&keys.log)
+            .key(&keys.producers)
+            .key(&keys.tombstone)
+            .key(&keys.current)
+            .key(&keys.streams)
+            .key(&keys.ended)
+            .arg(op)
+            .arg(&keys.run)
+            .arg(&keys.name)
+            .arg(if keys.standalone { "1" } else { "0" })
+            .arg(self.retention_ms())
+            .arg(u64::try_from(idle.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    /// Runs a script invocation, retrying transient failures.
+    async fn invoke<T: redis::FromRedisValue>(
+        &self,
+        invocation: &redis::ScriptInvocation<'_>,
+    ) -> Result<T> {
+        with_retries(|| {
             let mut conn = self.conn.clone();
             async move {
-                let ids: Vec<String> = invocation
+                invocation
                     .invoke_async(&mut conn)
                     .await
-                    .map_err(redis_error)?;
-                Ok(ids)
+                    .map_err(redis_error)
             }
         })
         .await
     }
 
-    fn chain_keys(&self, owner: &str, first_run: &str) -> ChainKeys {
-        let prefix = format!("{}:{first_run}", self.owner_prefix(owner));
-        ChainKeys {
+    /// Whether the stream is closed, closing a standalone stream that has reached its idle timeout
+    /// first.
+    async fn closed(&self, conn: &mut ConnectionManager, keys: &StreamKeys) -> Result<bool> {
+        if keys.standalone {
+            let mut invocation = self.script.prepare_invoke();
+            invocation.key(&keys.meta).arg("close_if_idle");
+            let closed: i64 = self.invoke(&invocation).await?;
+            return Ok(closed == 1);
+        }
+        let closed: Option<String> = conn.hget(&keys.meta, "closed").await.map_err(redis_error)?;
+        Ok(closed.as_deref() == Some("1"))
+    }
+
+    fn retention_ms(&self) -> u64 {
+        u64::try_from(self.retention.as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The keys a create, append or close writes, which for an owner's stream needs the owner's run
+    /// ID.
+    fn write_keys(&self, stream: &StreamRef) -> Result<StreamKeys> {
+        if stream.stream_id.is_empty() {
+            required_run(stream)?;
+        }
+        Ok(self.keys(stream, owner_run(stream)))
+    }
+
+    fn keys(&self, stream: &StreamRef, run: &str) -> StreamKeys {
+        let owner = owner_key(stream);
+        let run_prefix = format!("{}:{run}:", self.owner_prefix(&owner));
+        let prefix = format!("{run_prefix}{}", stream.name);
+        StreamKeys {
             meta: format!("{prefix}:meta"),
             log: format!("{prefix}:log"),
             producers: format!("{prefix}:producers"),
             tombstone: format!("{prefix}:tombstone"),
-            current: self.current_key(owner),
-            first_run: first_run.to_string(),
+            current: self.current_key(&owner),
+            streams: format!("{run_prefix}streams"),
+            ended: format!("{run_prefix}ended"),
+            run: run.to_string(),
+            name: stream.name.clone(),
+            standalone: !stream.stream_id.is_empty(),
+            run_prefix,
             prefix,
         }
     }
@@ -452,9 +567,10 @@ impl RedisBackend {
         format!("{}:current", self.owner_prefix(owner))
     }
 
-    /// Splits a cursor, `<owner prefix>:<run ID>#<entry ID>`, into its run and entry. The prefix
-    /// binds the cursor to the namespace and owner.
-    fn parse_cursor(&self, owner: &str, cursor: &[u8]) -> Result<(String, String)> {
+    /// Splits a cursor, `<owner prefix>:<run ID>:<name>#<entry ID>`, into its run and entry. The
+    /// prefix and name bind the cursor to the namespace, owner and stream. Run IDs contain no ':'
+    /// and entry IDs no '#'; names may contain either.
+    fn parse_cursor(&self, stream: &StreamRef, cursor: &[u8]) -> Result<(String, String)> {
         let mismatch = || {
             Error::stream(
                 StreamFailureType::CursorMismatch,
@@ -463,24 +579,35 @@ impl RedisBackend {
         };
         let cursor = std::str::from_utf8(cursor).map_err(|_| mismatch())?;
         let (chain, entry_id) = cursor.rsplit_once('#').ok_or_else(mismatch)?;
-        let first_run = chain
-            .strip_prefix(&format!("{}:", self.owner_prefix(owner)))
+        let (first_run, name) = chain
+            .strip_prefix(&format!("{}:", self.owner_prefix(&owner_key(stream))))
+            .and_then(|rest| rest.split_once(':'))
             .ok_or_else(mismatch)?;
+        if name != stream.name {
+            return Err(mismatch());
+        }
         Ok((first_run.to_string(), entry_id.to_string()))
     }
 }
 
-struct ChainKeys {
+/// The keys of one stream, of its owner run (streams, ended), and the key holding the owner ID's
+/// latest run. run_prefix is the prefix of the owner run's stream keys.
+struct StreamKeys {
     prefix: String,
     meta: String,
     log: String,
     producers: String,
     tombstone: String,
     current: String,
-    first_run: String,
+    streams: String,
+    ended: String,
+    run_prefix: String,
+    run: String,
+    name: String,
+    standalone: bool,
 }
 
-impl ChainKeys {
+impl StreamKeys {
     fn cursor(&self, entry_id: &str) -> Vec<u8> {
         format!("{}#{entry_id}", self.prefix).into_bytes()
     }
@@ -557,7 +684,7 @@ fn record(
     }))
 }
 
-async fn close_from_meta(conn: &mut ConnectionManager, keys: &ChainKeys) -> Result<StreamClose> {
+async fn close_from_meta(conn: &mut ConnectionManager, keys: &StreamKeys) -> Result<StreamClose> {
     let meta: HashMap<String, Vec<u8>> = conn.hgetall(&keys.meta).await.map_err(redis_error)?;
     let field = |name: &str| meta.get(name).cloned().unwrap_or_default();
     let failure = field("close_failure");
@@ -612,27 +739,27 @@ fn digest(entries: &[Vec<(&str, Vec<u8>)>]) -> String {
 }
 
 fn stream_ref(stream: &Option<StreamRef>) -> Result<&StreamRef> {
-    stream
+    let stream = stream
         .as_ref()
-        .filter(|s| s.workflow_id.is_empty() != s.activity_id.is_empty())
-        .ok_or_else(|| {
-            Error::InvalidArgument(
-                "a stream is named by exactly one of a workflow ID and an activity ID".into(),
-            )
-        })
+        .ok_or_else(|| Error::InvalidArgument("stream is required".into()))?;
+    stream_ref::validate(stream)?;
+    Ok(stream)
 }
 
-/// Names a stream's owner, so that a workflow and an activity with the same ID have different
-/// streams.
+/// Names a stream's owner, so that a workflow, an activity and a standalone stream with the same ID
+/// have different streams.
 fn owner_key(stream: &StreamRef) -> String {
-    if stream.activity_id.is_empty() {
-        format!("workflow/{}", stream.workflow_id)
-    } else {
+    if !stream.activity_id.is_empty() {
         format!("activity/{}", stream.activity_id)
+    } else if !stream.stream_id.is_empty() {
+        format!("stream/{}", stream.stream_id)
+    } else {
+        format!("workflow/{}", stream.workflow_id)
     }
 }
 
-/// The run ID that pins a stream: a workflow's first run ID, or the activity's run ID.
+/// The run ID that pins a stream: a workflow's first run ID, or the activity's run ID. A standalone
+/// stream has none.
 fn owner_run(stream: &StreamRef) -> &str {
     if stream.activity_id.is_empty() {
         &stream.first_run_id
