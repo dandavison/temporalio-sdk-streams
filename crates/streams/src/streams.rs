@@ -140,22 +140,15 @@ impl Streams {
             }
         }
         let mut run = self.runs.for_task(stream, owner);
-        if req.commit_mode {
-            let mut messages = vec![];
-            for writes in req.streams {
-                match commit_mode_messages(&mut run, &writes.name, writes.records) {
-                    Ok(m) => messages.extend(m),
-                    Err(e) => {
-                        self.runs.put(run);
-                        return Err(e);
-                    }
-                }
-            }
-            self.runs.put(run);
-            return Ok(messages);
-        }
+        let mut messages = vec![];
         for writes in req.streams {
-            if let Err(e) = self.write_stream(&mut run, writes).await {
+            let written = if req.commit_mode && writes.stream_id.is_empty() {
+                commit_mode_messages(&mut run, &writes.name, writes.records)
+                    .map(|m| messages.extend(m))
+            } else {
+                self.write_stream(&mut run, writes).await
+            };
+            if let Err(e) = written {
                 self.runs.put(run);
                 return Err(e);
             }
@@ -164,14 +157,27 @@ impl Streams {
             run.pending_close = close_for_ending(ending);
         }
         self.runs.put(run);
-        Ok(vec![])
+        Ok(messages)
     }
 
     /// Appends one stream's records, as the run's workflow task, and then its close, if any.
     async fn write_stream(&self, run: &mut Run, writes: WorkflowStreamWrites) -> Result<()> {
-        let stream = run.stream(&writes.name);
+        let stream = if writes.stream_id.is_empty() {
+            run.stream(&writes.name)
+        } else {
+            if writes.close.is_some() {
+                return Err(Error::InvalidArgument(
+                    "a workflow cannot close a standalone stream".into(),
+                ));
+            }
+            api::StreamRef {
+                stream_id: writes.stream_id.clone(),
+                ..Default::default()
+            }
+        };
+        let key = (writes.name.clone(), writes.stream_id.clone());
         for records in limits::split(writes.records)? {
-            let seq = run.next_seq.get(&writes.name).copied().unwrap_or(0);
+            let seq = run.next_seq.get(&key).copied().unwrap_or(0);
             self.append(api::AppendRequest {
                 stream: Some(stream.clone()),
                 producer: Some(Producer {
@@ -182,10 +188,10 @@ impl Streams {
                 finish: false,
             })
             .await?;
-            run.next_seq.insert(writes.name.clone(), seq + 1);
+            run.next_seq.insert(key.clone(), seq + 1);
         }
         if let Some(close) = writes.close {
-            let seq = run.next_seq.get(&writes.name).copied().unwrap_or(0);
+            let seq = run.next_seq.get(&key).copied().unwrap_or(0);
             self.close(api::CloseRequest {
                 stream: Some(stream),
                 owner: Some(run.owner.clone()),
@@ -194,7 +200,7 @@ impl Streams {
                 activity_owner: None,
             })
             .await?;
-            run.next_seq.insert(writes.name, seq + 1);
+            run.next_seq.insert(key, seq + 1);
         }
         Ok(())
     }

@@ -145,9 +145,12 @@ message WorkflowActivationCompletedRequest {
     repeated WorkflowStreamWrites streams = 10;
 }
 
-// An activation's writes to one of its workflow's own streams.
+// An activation's writes to one of its workflow's own streams, by name, or to a standalone stream,
+// by stream_id. A workflow appends to a standalone stream as an unverified producer, sink-style,
+// also when it declares commit mode, and cannot close it.
 message WorkflowStreamWrites {
     string name = 1;
+    string stream_id = 4;
     repeated temporal.api.nexusservices.streamservice.v1.AppendRecord records = 2;
     // The workflow closed this stream in the activation. The crate closes the stream after appending
     // the records, as the activation's workflow task, so the close at the run's end leaves it as it

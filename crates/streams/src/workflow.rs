@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 /// What the worker knows of a run's appends: its current workflow task attempt, the next seq in
-/// that attempt for each of its streams, the next commit-mode message's number, and a close to write
+/// that attempt for each stream it writes to, keyed by name and stream ID, the next commit-mode message's number, and a close to write
 /// once the server has accepted the run's terminal completion. Keyed by run ID; an entry is removed
 /// when the run is evicted.
 #[derive(Default)]
@@ -21,7 +21,7 @@ pub struct Run {
     /// The run's stream named "", whose name each append replaces.
     pub stream: StreamRef,
     pub owner: WorkflowProducer,
-    pub next_seq: HashMap<String, i64>,
+    pub next_seq: HashMap<(String, String), i64>,
     pub next_message: i64,
     pub pending_close: Option<StreamClose>,
 }
