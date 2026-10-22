@@ -9,12 +9,14 @@ use std::time::Duration;
 use temporalio_streams::proto::Payload;
 use temporalio_streams::proto::api::{
     ActivityProducer, AppendRequest, AppendResponse, ClientProducer, CloseRequest, CloseResponse,
-    Producer, ReadRequest, RedisOptions, StreamRef, WorkflowActivationCompletedRequest,
-    WorkflowActivationCompletedResponse, WorkflowEnding, WorkflowEvictedRequest,
-    WorkflowEvictedResponse, WorkflowProducer, producer::Variant,
+    CreateRequest, Producer, ReadRequest, RedisOptions, StreamRef,
+    WorkflowActivationCompletedRequest, WorkflowActivationCompletedResponse, WorkflowEnding,
+    WorkflowEvictedRequest, WorkflowEvictedResponse, WorkflowProducer, WorkflowStreamWrites,
+    producer::Variant,
 };
 use temporalio_streams::proto::service::{
-    AppendRecord, CloseState, ReadResponse, StreamClose, StreamFailureType,
+    AppendRecord, CloseState, CreateResponse, ReadResponse, StreamClose, StreamFailureType,
+    StreamSettings,
 };
 use temporalio_streams::{Error, Streams};
 use tokio::time::sleep;
@@ -98,9 +100,14 @@ async fn call<Resp: Message + Default>(
 }
 
 fn stream(first_run_id: &str) -> StreamRef {
+    named_stream(first_run_id, "main")
+}
+
+fn named_stream(first_run_id: &str, name: &str) -> StreamRef {
     StreamRef {
         workflow_id: "wf".into(),
         first_run_id: first_run_id.into(),
+        name: name.into(),
         ..Default::default()
     }
 }
@@ -109,6 +116,14 @@ fn activity_stream(activity_id: &str, run_id: &str) -> StreamRef {
     StreamRef {
         activity_id: activity_id.into(),
         activity_run_id: run_id.into(),
+        name: "main".into(),
+        ..Default::default()
+    }
+}
+
+fn standalone_stream(stream_id: &str) -> StreamRef {
+    StreamRef {
+        stream_id: stream_id.into(),
         ..Default::default()
     }
 }
@@ -159,11 +174,21 @@ async fn append(
     seq: i64,
     values: &[&str],
 ) -> Result<Vec<Vec<u8>>, Error> {
+    append_to(streams, stream(first_run_id), producer, seq, values).await
+}
+
+async fn append_to(
+    streams: &Streams,
+    stream: StreamRef,
+    producer: Producer,
+    seq: i64,
+    values: &[&str],
+) -> Result<Vec<Vec<u8>>, Error> {
     let resp: AppendResponse = call(
         streams,
         "Append",
         AppendRequest {
-            stream: Some(stream(first_run_id)),
+            stream: Some(stream),
             producer: Some(producer),
             seq,
             records: records(values),
@@ -172,6 +197,39 @@ async fn append(
     )
     .await?;
     Ok(resp.cursors)
+}
+
+async fn create(
+    streams: &Streams,
+    stream: StreamRef,
+    request_id: &str,
+    idle_timeout: Option<Duration>,
+) -> Result<bool, Error> {
+    let resp: CreateResponse = call(
+        streams,
+        "Create",
+        CreateRequest {
+            stream: Some(stream),
+            request_id: request_id.into(),
+            settings: idle_timeout.map(|d| StreamSettings {
+                idle_timeout: Some(proto_duration(d)),
+            }),
+        },
+    )
+    .await?;
+    Ok(resp.created)
+}
+
+fn close_request(stream: StreamRef, state: CloseState, reason: &str) -> CloseRequest {
+    CloseRequest {
+        stream: Some(stream),
+        close: Some(StreamClose {
+            state: state.into(),
+            reason: reason.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
 }
 
 async fn read(streams: &Streams, stream: StreamRef, after: Vec<u8>) -> Result<ReadResponse, Error> {
@@ -214,6 +272,15 @@ async fn activation_completed(
     values: &[&str],
     ending: Option<WorkflowEnding>,
 ) -> Result<(), Error> {
+    activation_wrote(streams, owner, vec![writes("main", values)], ending).await
+}
+
+async fn activation_wrote(
+    streams: &Streams,
+    owner: WorkflowProducer,
+    writes: Vec<WorkflowStreamWrites>,
+    ending: Option<WorkflowEnding>,
+) -> Result<(), Error> {
     let _: WorkflowActivationCompletedResponse = call(
         streams,
         "WorkflowActivationCompleted",
@@ -223,13 +290,21 @@ async fn activation_completed(
             first_run_id: "run-1".into(),
             previous_started_event_id: owner.previous_started_event_id,
             attempt: owner.attempt,
-            records: records(values),
+            streams: writes,
             ending,
             ..Default::default()
         },
     )
     .await?;
     Ok(())
+}
+
+fn writes(name: &str, values: &[&str]) -> WorkflowStreamWrites {
+    WorkflowStreamWrites {
+        name: name.into(),
+        records: records(values),
+        close: None,
+    }
 }
 
 async fn evicted(streams: &Streams, execution_ending: bool) {
@@ -693,7 +768,7 @@ async fn commit_mode_activation_is_refused() {
             first_run_id: "run-1".into(),
             previous_started_event_id: 3,
             attempt: 1,
-            records: records(&["a"]),
+            streams: vec![writes("main", &["a"])],
             commit_mode: true,
             ..Default::default()
         },
@@ -718,12 +793,14 @@ async fn workflow_close_follows_the_activation_records_and_replaces_the_ending_c
             first_run_id: "run-1".into(),
             previous_started_event_id: 3,
             attempt: 1,
-            records: records(&["a"]),
-            close: Some(StreamClose {
-                state: CloseState::Failed.into(),
-                reason: "done".into(),
-                ..Default::default()
-            }),
+            streams: vec![WorkflowStreamWrites {
+                close: Some(StreamClose {
+                    state: CloseState::Failed.into(),
+                    reason: "done".into(),
+                    ..Default::default()
+                }),
+                ..writes("main", &["a"])
+            }],
             ..Default::default()
         },
     )
@@ -752,4 +829,243 @@ async fn workflow_close_follows_the_activation_records_and_replaces_the_ending_c
         .close
         .unwrap();
     assert_eq!(close.state(), CloseState::Failed);
+}
+
+#[tokio::test]
+async fn an_owners_named_streams_are_independent() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let main = append(&s, "run-1", client(1), 0, &["a"]).await.unwrap();
+    append_to(&s, named_stream("run-1", "other"), client(1), 0, &["b"])
+        .await
+        .unwrap();
+    assert_eq!(
+        values(&read(&s, stream("run-1"), vec![]).await.unwrap()),
+        ["a"]
+    );
+    assert_eq!(
+        values(
+            &read(&s, named_stream("run-1", "other"), vec![])
+                .await
+                .unwrap()
+        ),
+        ["b"]
+    );
+    assert_eq!(
+        failure_type(read(&s, named_stream("run-1", "other"), main[0].clone()).await),
+        StreamFailureType::CursorMismatch
+    );
+}
+
+#[tokio::test]
+async fn stream_references_are_validated() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    for bad in [
+        named_stream("run-1", ""),
+        named_stream("run-1", &"n".repeat(256)),
+        StreamRef {
+            name: "n".into(),
+            ..standalone_stream("s")
+        },
+        StreamRef {
+            stream_id: "s".into(),
+            ..stream("run-1")
+        },
+    ] {
+        let result = append_to(&s, bad.clone(), client(1), 0, &["x"]).await;
+        assert!(
+            matches!(result, Err(Error::InvalidArgument(_))),
+            "{bad:?}: {result:?}"
+        );
+    }
+    append_to(
+        &s,
+        named_stream("run-1", &"n".repeat(255)),
+        client(1),
+        0,
+        &["x"],
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn created_stream_exists_and_create_is_idempotent_by_request_id() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    assert!(!read(&s, stream("run-1"), vec![]).await.unwrap().exists);
+    for (request_id, created) in [("r1", true), ("r1", true), ("r2", false)] {
+        assert_eq!(
+            create(&s, stream("run-1"), request_id, None).await.unwrap(),
+            created,
+            "{request_id}"
+        );
+    }
+    let resp = read(&s, stream("run-1"), vec![]).await.unwrap();
+    assert!(resp.exists);
+    assert!(resp.records.is_empty());
+    append(&s, "run-1", client(1), 0, &["a"]).await.unwrap();
+    assert_eq!(
+        values(&read(&s, stream("run-1"), vec![]).await.unwrap()),
+        ["a"]
+    );
+}
+
+#[tokio::test]
+async fn create_with_other_settings_fails() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let hour = Duration::from_secs(3600);
+    create(&s, standalone_stream("s"), "r1", Some(hour))
+        .await
+        .unwrap();
+    for idle in [Some(2 * hour), None] {
+        assert_eq!(
+            failure_type(create(&s, standalone_stream("s"), "r2", idle).await),
+            StreamFailureType::SettingsMismatch
+        );
+    }
+    let result = create(&s, stream("run-1"), "r1", Some(hour)).await;
+    assert!(
+        matches!(result, Err(Error::InvalidArgument(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
+async fn standalone_stream_closes_when_idle() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    create(
+        &s,
+        standalone_stream("s"),
+        "",
+        Some(Duration::from_millis(200)),
+    )
+    .await
+    .unwrap();
+    append_to(&s, standalone_stream("s"), client(1), 0, &["a"])
+        .await
+        .unwrap();
+    assert!(
+        read(&s, standalone_stream("s"), vec![])
+            .await
+            .unwrap()
+            .close
+            .is_none()
+    );
+    sleep(Duration::from_millis(300)).await;
+    let resp = read(&s, standalone_stream("s"), vec![]).await.unwrap();
+    assert_eq!(values(&resp), ["a"]);
+    let close = resp.close.unwrap();
+    assert_eq!(
+        (close.state(), close.reason.as_str()),
+        (CloseState::TimedOut, "idle timeout")
+    );
+    assert_eq!(
+        failure_type(append_to(&s, standalone_stream("s"), client(1), 1, &["b"]).await),
+        StreamFailureType::Closed
+    );
+}
+
+#[tokio::test]
+async fn any_caller_closes_a_standalone_stream() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    assert_eq!(
+        failure_type(
+            call::<CloseResponse>(
+                &s,
+                "Close",
+                close_request(standalone_stream("s"), CloseState::Completed, "")
+            )
+            .await
+        ),
+        StreamFailureType::NotFound
+    );
+    append_to(&s, standalone_stream("s"), client(1), 0, &["a"])
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let _: CloseResponse = call(
+            &s,
+            "Close",
+            close_request(standalone_stream("s"), CloseState::Completed, "done"),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        failure_type(
+            call::<CloseResponse>(
+                &s,
+                "Close",
+                close_request(standalone_stream("s"), CloseState::Failed, "")
+            )
+            .await
+        ),
+        StreamFailureType::Closed
+    );
+    let close = read(&s, standalone_stream("s"), vec![])
+        .await
+        .unwrap()
+        .close
+        .unwrap();
+    assert_eq!(
+        (close.state(), close.reason.as_str()),
+        (CloseState::Completed, "done")
+    );
+}
+
+#[tokio::test]
+async fn activation_writes_go_to_their_streams() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    activation_wrote(
+        &s,
+        owner(3, 1),
+        vec![writes("main", &["a"]), writes("other", &["b"])],
+        None,
+    )
+    .await
+    .unwrap();
+    for (name, value) in [("main", "a"), ("other", "b")] {
+        let resp = read(&s, named_stream("run-1", name), vec![]).await.unwrap();
+        assert_eq!(values(&resp), [value]);
+        assert_eq!(resp.records[0].producer.as_ref().unwrap().seq, 0);
+    }
+}
+
+#[tokio::test]
+async fn ending_eviction_closes_every_stream_of_the_run() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    append_to(&s, named_stream("run-1", "by-client"), client(1), 0, &["c"])
+        .await
+        .unwrap();
+    activation_wrote(
+        &s,
+        owner(3, 1),
+        vec![writes("main", &["a"]), writes("other", &["b"])],
+        ending(CloseState::Completed, false, false),
+    )
+    .await
+    .unwrap();
+    evicted(&s, true).await;
+    for name in ["main", "other", "by-client"] {
+        let close = read(&s, named_stream("run-1", name), vec![])
+            .await
+            .unwrap()
+            .close;
+        assert_eq!(
+            close.map(|c| c.state()),
+            Some(CloseState::Completed),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        failure_type(append_to(&s, named_stream("run-1", "later"), client(1), 0, &["d"]).await),
+        StreamFailureType::Closed
+    );
 }
