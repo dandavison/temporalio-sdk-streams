@@ -303,7 +303,7 @@ fn writes(name: &str, values: &[&str]) -> WorkflowStreamWrites {
     WorkflowStreamWrites {
         name: name.into(),
         records: records(values),
-        close: None,
+        ..Default::default()
     }
 }
 
@@ -1067,5 +1067,36 @@ async fn ending_eviction_closes_every_stream_of_the_run() {
     assert_eq!(
         failure_type(append_to(&s, named_stream("run-1", "later"), client(1), 0, &["d"]).await),
         StreamFailureType::Closed
+    );
+}
+
+#[tokio::test]
+async fn activation_writes_to_a_standalone_stream() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    activation_wrote(
+        &s,
+        owner(3, 1),
+        vec![
+            WorkflowStreamWrites {
+                stream_id: "s".into(),
+                ..writes("", &["a"])
+            },
+            writes("main", &["b"]),
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+    let resp = read(&s, standalone_stream("s"), vec![]).await.unwrap();
+    assert_eq!(values(&resp), ["a"]);
+    let p = resp.records[0].producer.as_ref().unwrap();
+    assert_eq!(
+        (p.producer.as_str(), p.workflow_task, p.seq),
+        ("workflow/run-1", 3, 0)
+    );
+    assert_eq!(
+        values(&read(&s, stream("run-1"), vec![]).await.unwrap()),
+        ["b"]
     );
 }
