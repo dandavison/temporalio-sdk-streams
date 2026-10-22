@@ -8,6 +8,7 @@ mod error;
 mod identity;
 mod limits;
 mod native;
+mod notify;
 pub mod proto;
 mod redis;
 mod retry;

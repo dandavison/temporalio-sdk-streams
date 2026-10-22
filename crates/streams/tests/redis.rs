@@ -11,12 +11,12 @@ use temporalio_streams::proto::api::{
     ActivityProducer, AppendRequest, AppendResponse, ClientProducer, CloseRequest, CloseResponse,
     CreateRequest, Producer, ReadRequest, RedisOptions, StreamRef,
     WorkflowActivationCompletedRequest, WorkflowActivationCompletedResponse, WorkflowEnding,
-    WorkflowEvictedRequest, WorkflowEvictedResponse, WorkflowProducer, WorkflowStreamWrites,
-    producer::Variant,
+    WorkflowEvictedRequest, WorkflowEvictedResponse, WorkflowProducer, WorkflowReadRequest,
+    WorkflowReadResponse, WorkflowStreamWrites, producer::Variant,
 };
 use temporalio_streams::proto::service::{
     AppendRecord, CloseState, CreateResponse, ReadResponse, StreamClose, StreamFailureType,
-    StreamSettings,
+    StreamMode, StreamSettings,
 };
 use temporalio_streams::{Error, Streams};
 use tokio::time::sleep;
@@ -82,11 +82,14 @@ impl Drop for RedisServer {
 }
 
 async fn connect(server: &RedisServer) -> Result<Streams, Error> {
-    Streams::redis(RedisOptions {
-        url: server.url(),
-        namespace: "default".into(),
-        retention: Some(proto_duration(RETENTION)),
-    })
+    Streams::redis(
+        RedisOptions {
+            url: server.url(),
+            namespace: "default".into(),
+            retention: Some(proto_duration(RETENTION)),
+        },
+        None,
+    )
     .await
 }
 
@@ -1099,4 +1102,142 @@ async fn activation_writes_to_a_standalone_stream() {
         values(&read(&s, stream("run-1"), vec![]).await.unwrap()),
         ["b"]
     );
+}
+
+#[tokio::test]
+async fn read_stops_at_until() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let cursors = append(&s, "run-1", client(1), 0, &["a", "b", "c"])
+        .await
+        .unwrap();
+    let resp: ReadResponse = call(
+        &s,
+        "Read",
+        ReadRequest {
+            stream: Some(stream("run-1")),
+            after: cursors[0].clone(),
+            until: cursors[1].clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(values(&resp), ["b"]);
+    assert_eq!(resp.cursor, cursors[1]);
+}
+
+#[tokio::test]
+async fn read_stops_before_the_record_that_would_exceed_max_bytes() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    // Each payload encodes to 6 bytes.
+    let cursors = append(&s, "run-1", client(1), 0, &["aaaa", "bbbb", "cccc"])
+        .await
+        .unwrap();
+    let read_bounded = |after: Vec<u8>, max_bytes: i64| {
+        call::<ReadResponse>(
+            &s,
+            "Read",
+            ReadRequest {
+                stream: Some(stream("run-1")),
+                after,
+                max_bytes,
+                ..Default::default()
+            },
+        )
+    };
+    let resp = read_bounded(vec![], 13).await.unwrap();
+    assert_eq!(values(&resp), ["aaaa", "bbbb"]);
+    assert_eq!(resp.cursor, cursors[1]);
+    assert_eq!(
+        values(&read_bounded(resp.cursor, 13).await.unwrap()),
+        ["cccc"]
+    );
+    assert_eq!(
+        failure_type(read_bounded(vec![], 5).await),
+        StreamFailureType::TooLarge
+    );
+}
+
+#[tokio::test]
+async fn read_reports_sink_mode_and_the_retention() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    append(&s, "run-1", client(1), 0, &["a"]).await.unwrap();
+    let resp = read(&s, stream("run-1"), vec![]).await.unwrap();
+    assert_eq!(resp.mode(), StreamMode::Sink);
+    assert_eq!(resp.retention, Some(proto_duration(RETENTION)));
+    assert_eq!(resp.owner_close_time, None);
+}
+
+async fn workflow_read(
+    streams: &Streams,
+    stream: StreamRef,
+    after: Vec<u8>,
+    until: Vec<u8>,
+    max_records: i32,
+    notifier: bool,
+) -> Result<WorkflowReadResponse, Error> {
+    call(
+        streams,
+        "WorkflowRead",
+        WorkflowReadRequest {
+            read: Some(ReadRequest {
+                stream: Some(stream),
+                after,
+                until,
+                max_records,
+                ..Default::default()
+            }),
+            notifier,
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn workflow_read_of_the_same_range_has_the_same_digest() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let cursors = append(&s, "run-1", client(1), 0, &["a", "b", "c"])
+        .await
+        .unwrap();
+    let first = workflow_read(&s, stream("run-1"), vec![], vec![], 2, false)
+        .await
+        .unwrap();
+    let read = first.read.unwrap();
+    assert_eq!(values(&read), ["a", "b"]);
+    assert_eq!(first.digest.len(), 32);
+    let reread = workflow_read(&s, stream("run-1"), vec![], read.cursor, 0, false)
+        .await
+        .unwrap();
+    assert_eq!(reread.digest, first.digest);
+    let other = workflow_read(
+        &s,
+        stream("run-1"),
+        cursors[0].clone(),
+        cursors[2].clone(),
+        0,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_ne!(other.digest, first.digest);
+}
+
+#[tokio::test]
+async fn workflow_read_of_a_missing_standalone_stream_reports_it_not_found() {
+    let server = RedisServer::start(&[]).await;
+    let s = connect(&server).await.unwrap();
+    let resp = workflow_read(&s, standalone_stream("s"), vec![], vec![], 0, true)
+        .await
+        .unwrap();
+    assert!(resp.owner_not_found);
+    create(&s, standalone_stream("s"), "r", None).await.unwrap();
+    let resp = workflow_read(&s, standalone_stream("s"), vec![], vec![], 0, false)
+        .await
+        .unwrap();
+    assert!(!resp.owner_not_found);
+    assert!(resp.read.unwrap().exists);
 }
