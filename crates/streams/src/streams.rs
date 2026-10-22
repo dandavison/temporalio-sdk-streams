@@ -212,7 +212,7 @@ impl Streams {
     }
 
     /// Appends one stream's records, as the run's workflow task, and then its close, if any, and
-    /// notifies the stream.
+    /// notifies the stream if it wrote either.
     async fn write_stream(&self, run: &mut Run, writes: WorkflowStreamWrites) -> Result<()> {
         let stream = if writes.stream_id.is_empty() {
             run.written.insert(writes.name.clone());
@@ -229,6 +229,7 @@ impl Streams {
             }
         };
         let key = (writes.name.clone(), writes.stream_id.clone());
+        let wrote = !writes.records.is_empty() || writes.close.is_some();
         for records in limits::split(writes.records)? {
             let seq = run.next_seq.get(&key).copied().unwrap_or(0);
             self.append(api::AppendRequest {
@@ -255,7 +256,9 @@ impl Streams {
             .await?;
             run.next_seq.insert(key, seq + 1);
         }
-        self.workflow_appended(&stream);
+        if wrote {
+            self.workflow_appended(&stream);
+        }
         Ok(())
     }
 
