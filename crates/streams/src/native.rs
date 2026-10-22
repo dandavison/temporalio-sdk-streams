@@ -27,13 +27,16 @@ use temporalio_client::tonic::metadata::{
     AsciiMetadataKey, AsciiMetadataValue, MetadataKey, MetadataValue,
 };
 use temporalio_client::tonic::{self, Code};
+use temporalio_protos::temporal::api::common::v1::WorkflowExecution;
 use temporalio_protos::temporal::api::workflowservice::v1::{
-    StartNexusOperationRequest, start_nexus_operation_response,
+    DescribeActivityExecutionRequest, DescribeWorkflowExecutionRequest, StartNexusOperationRequest,
+    start_nexus_operation_response,
 };
 
 const SYSTEM_ENDPOINT: &str = "__temporal_system";
 const SERVICE: &str = "temporal.api.nexusservices.streamservice.v1.StreamService";
 
+#[derive(Clone)]
 pub struct NativeBackend {
     connection: Connection,
     namespace: String,
@@ -142,10 +145,97 @@ impl NativeBackend {
                 max_records: req.max_records,
                 wait: req.wait,
                 last: req.last,
+                until: req.until,
+                max_bytes: req.max_bytes,
             },
             options,
         )
         .await
+    }
+
+    /// Tells the server that a stream in an external store was written, which fires the stream's
+    /// pending Waits. `retry` retries transient failures, as other calls do; otherwise the call is
+    /// made once.
+    pub async fn notify(&self, stream: &api::StreamRef, retry: bool) -> Result<()> {
+        let req = service::NotifyRequest {
+            stream: service_ref(Some(stream.clone())),
+        };
+        let _: service::NotifyResponse = if retry {
+            self.call("Notify", &req, CallOptions::default()).await?
+        } else {
+            self.call_once("Notify", &req, &CallOptions::default())
+                .await?
+        };
+        Ok(())
+    }
+
+    /// The notifier position of a stream in an external store, and how its owner ended.
+    pub async fn notifier_state(
+        &self,
+        stream: &api::StreamRef,
+    ) -> Result<service::NotifierStateResponse> {
+        self.call(
+            "NotifierState",
+            &service::NotifierStateRequest {
+                stream: service_ref(Some(stream.clone())),
+            },
+            CallOptions::default(),
+        )
+        .await
+    }
+
+    /// The run of the owner's current chain or execution, which names its streams: the current
+    /// workflow run's first run ID, or the activity's run ID. None if the owner does not exist.
+    pub async fn owner_run(&self, stream: &api::StreamRef) -> Result<Option<String>> {
+        let run = with_retries(|| {
+            let mut connection = self.connection.clone();
+            let namespace = self.namespace.clone();
+            let stream = stream.clone();
+            async move {
+                if stream.activity_id.is_empty() {
+                    WorkflowService::describe_workflow_execution(
+                        &mut connection,
+                        tonic::Request::new(DescribeWorkflowExecutionRequest {
+                            namespace,
+                            execution: Some(WorkflowExecution {
+                                workflow_id: stream.workflow_id,
+                                run_id: String::new(),
+                            }),
+                        }),
+                    )
+                    .await
+                    .map(|r| {
+                        r.into_inner()
+                            .workflow_execution_info
+                            .unwrap_or_default()
+                            .first_run_id
+                    })
+                } else {
+                    WorkflowService::describe_activity_execution(
+                        &mut connection,
+                        tonic::Request::new(DescribeActivityExecutionRequest {
+                            namespace,
+                            activity_id: stream.activity_id,
+                            ..Default::default()
+                        }),
+                    )
+                    .await
+                    .map(|r| r.into_inner().run_id)
+                }
+                .map_err(status_error)
+            }
+        })
+        .await;
+        match run {
+            Err(Error::Stream {
+                failure_type: StreamFailureType::NotFound,
+                ..
+            }) => Ok(None),
+            Ok(run) if run.is_empty() => Err(Error::Internal(
+                "the server did not give the owner's run ID".into(),
+            )),
+            run => run.map(Some),
+        }
     }
 
     /// Makes a direct Nexus call to the stream service, retrying transient failures. Retrying an
@@ -156,6 +246,16 @@ impl NativeBackend {
         operation: &str,
         req: &Req,
         options: CallOptions,
+    ) -> Result<Resp> {
+        with_retries(|| self.call_once(operation, req, &options)).await
+    }
+
+    /// Makes one direct Nexus call to the stream service.
+    async fn call_once<Req: Message + Name, Resp: Message + Default>(
+        &self,
+        operation: &str,
+        req: &Req,
+        options: &CallOptions,
     ) -> Result<Resp> {
         let request = StartNexusOperationRequest {
             namespace: self.namespace.clone(),
@@ -172,17 +272,14 @@ impl NativeBackend {
             }),
             ..Default::default()
         };
-        let response = with_retries(|| {
-            let mut connection = self.connection.clone();
-            let request = grpc_request(request.clone(), &options);
-            async move {
-                WorkflowService::start_nexus_operation(&mut connection, request?)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(status_error)
-            }
-        })
-        .await?;
+        let mut connection = self.connection.clone();
+        let response = WorkflowService::start_nexus_operation(
+            &mut connection,
+            grpc_request(request, options)?,
+        )
+        .await
+        .map(tonic::Response::into_inner)
+        .map_err(status_error)?;
         match response.variant {
             Some(start_nexus_operation_response::Variant::SyncSuccess(success)) => Ok(
                 Resp::decode(success.payload.unwrap_or_default().data.as_slice())?,

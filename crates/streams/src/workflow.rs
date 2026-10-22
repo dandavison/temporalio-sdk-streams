@@ -4,16 +4,19 @@
 use crate::error::Result;
 use crate::limits;
 use crate::proto::api::{StreamRef, WorkflowEnding, WorkflowProducer};
-use crate::proto::service::{AppendRecord, CloseState, CommitModeAppend, StreamClose};
+use crate::proto::service::{
+    AppendRecord, CloseState, CommitModeAppend, StreamClose, StreamMode, StreamModeDeclaration,
+};
 use prost::{Message, Name};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use temporalio_protos::temporal::api::protocol::v1::Message as ProtocolMessage;
 
 /// What the worker knows of a run's appends: its current workflow task attempt, the next seq in
-/// that attempt for each stream it writes to, keyed by name and stream ID, the next commit-mode message's number, and a close to write
-/// once the server has accepted the run's terminal completion. Keyed by run ID; an entry is removed
-/// when the run is evicted.
+/// that attempt for each stream it writes to, keyed by name and stream ID, the next commit-mode
+/// message's number, whether the attempt declared commit mode, the names of the run's own streams it
+/// wrote to, and a close to write once the server has accepted the run's terminal completion. Keyed
+/// by run ID; an entry is removed when the run is evicted.
 #[derive(Default)]
 pub struct Runs(Mutex<HashMap<String, Run>>);
 
@@ -23,6 +26,8 @@ pub struct Run {
     pub owner: WorkflowProducer,
     pub next_seq: HashMap<(String, String), i64>,
     pub next_message: i64,
+    pub declared: bool,
+    pub written: std::collections::BTreeSet<String>,
     pub pending_close: Option<StreamClose>,
 }
 
@@ -43,11 +48,13 @@ impl Runs {
         let mut runs = self.0.lock().unwrap();
         match runs.remove(&owner.run_id) {
             Some(run) if run.owner == owner => run,
-            _ => Run {
+            run => Run {
                 stream,
                 owner,
                 next_seq: HashMap::new(),
                 next_message: 0,
+                declared: false,
+                written: run.map(|r| r.written).unwrap_or_default(),
                 pending_close: None,
             },
         }
@@ -79,41 +86,63 @@ pub fn close_for_ending(ending: WorkflowEnding) -> Option<StreamClose> {
 }
 
 /// The records for the run's stream named name as commit-mode protocol messages, one for each
-/// append that fits the size limits, with IDs unique within the run's workflow task attempt. The
-/// server assigns the appends' seqs itself. Nothing limits the total: all of a workflow task's
-/// messages travel in its one completion, so enough records can exceed the server's request size
-/// limit.
+/// append that fits the size limits, after a declaration of the run's streams' mode if `declare` is
+/// set and the task attempt has not declared it, with IDs unique within the run's workflow task
+/// attempt. The server assigns the appends' seqs itself. Nothing limits the total: all of a workflow
+/// task's messages travel in its one completion, so enough records can exceed the server's request
+/// size limit.
 pub fn commit_mode_messages(
     run: &mut Run,
     name: &str,
     records: Vec<AppendRecord>,
+    declare: bool,
 ) -> Result<Vec<ProtocolMessage>> {
-    limits::split(records)?
-        .into_iter()
-        .map(|records| {
-            let owner = &run.owner;
-            let id = format!(
-                "stream/{}/{}/{}/{}",
-                owner.run_id, owner.previous_started_event_id, owner.attempt, run.next_message
-            );
-            run.next_message += 1;
-            let append = CommitModeAppend {
+    let mut messages = declaration(run, declare);
+    for records in limits::split(records)? {
+        messages.push(message(
+            run,
+            &CommitModeAppend {
                 records,
                 name: name.to_string(),
-            };
-            let mut message = ProtocolMessage {
-                id,
-                protocol_instance_id: "stream".into(),
-                body: Some(Default::default()),
-                ..Default::default()
-            };
-            if let Some(body) = message.body.as_mut() {
-                body.type_url = format!("type.googleapis.com/{}", CommitModeAppend::full_name());
-                body.value = append.encode_to_vec();
-            }
-            Ok(message)
-        })
-        .collect()
+            },
+        ));
+    }
+    Ok(messages)
+}
+
+/// A declaration of the run's streams' mode as commit, if `declare` is set and the task attempt
+/// has not declared it.
+pub fn declaration(run: &mut Run, declare: bool) -> Vec<ProtocolMessage> {
+    if !declare || run.declared {
+        return vec![];
+    }
+    run.declared = true;
+    vec![message(
+        run,
+        &StreamModeDeclaration {
+            mode: StreamMode::Commit.into(),
+        },
+    )]
+}
+
+fn message<B: Message + Name>(run: &mut Run, body: &B) -> ProtocolMessage {
+    let owner = &run.owner;
+    let id = format!(
+        "stream/{}/{}/{}/{}",
+        owner.run_id, owner.previous_started_event_id, owner.attempt, run.next_message
+    );
+    run.next_message += 1;
+    let mut message = ProtocolMessage {
+        id,
+        protocol_instance_id: "stream".into(),
+        body: Some(Default::default()),
+        ..Default::default()
+    };
+    if let Some(any) = message.body.as_mut() {
+        any.type_url = format!("type.googleapis.com/{}", B::full_name());
+        any.value = body.encode_to_vec();
+    }
+    message
 }
 
 #[cfg(test)]
@@ -131,6 +160,8 @@ mod tests {
             },
             next_seq: HashMap::new(),
             next_message: 0,
+            declared: false,
+            written: Default::default(),
             pending_close: None,
         }
     }
